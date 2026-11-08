@@ -1,5 +1,6 @@
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
+import { withWorkspaceRestore } from "@paperclipai/adapter-utils/workspace-restore-result";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -797,7 +798,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     };
 
-    try {
+    const executeTurn = async () => {
       const initial = await runAttempt(sessionId);
       const initialFailed =
         !initial.proc.timedOut && ((initial.proc.exitCode ?? 0) !== 0 || Boolean(initial.parsed.errorMessage));
@@ -815,16 +816,48 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
 
       return toResult(initial);
+    };
+
+    try {
+      return await withWorkspaceRestore(
+        async () => {
+          let result: AdapterExecutionResult;
+          let collectionFailed = false;
+          const collectionFailureMessage = "Instruction collection failed after provider stop. No instruction save is claimed.";
+          try {
+            result = await executeTurn();
+          } finally {
+            try {
+              await providerStop.collectBeforeRestore();
+            } catch {
+              collectionFailed = true;
+              await onLog("stderr", `[paperclip] ${collectionFailureMessage}\n`).catch(() => undefined);
+            }
+          }
+          if (!collectionFailed) return result;
+          const providerFailed = result.timedOut || result.signal || result.errorCode
+            || (result.exitCode !== null && result.exitCode !== 0);
+          return {
+            ...result,
+            ...(!providerFailed ? { errorCode: "instruction_collection_failed" } : {}),
+            errorMessage: [result.errorMessage, collectionFailureMessage].filter(Boolean).join(" "),
+            resultJson: { ...result.resultJson, instructionCollectionFailure: "collection_failed" },
+          };
+        },
+        // A provider deadline may already have stopped the allocation. Preserve
+        // that execution result and classify failed export as workspace recovery;
+        // never restart a stopped sandbox just to copy files back.
+        async () => { await restoreRemoteWorkspace?.(); },
+      );
     } finally {
-      try {
-        await providerStop.collectBeforeRestore();
-      } finally {
-        await Promise.all([
-          paperclipBridge?.stop(),
-          restoreRemoteWorkspace?.(),
-          localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
-        ]);
-      }
+      await Promise.all([
+        paperclipBridge?.stop().catch(async () => {
+          // Cleanup cannot replace a settled result or an unknown-stop error.
+          // This warning is not evidence that the provider or bridge stopped.
+          await onLog("stderr", "[paperclip] OpenCode bridge cleanup unconfirmed; execution outcome preserved.\n").catch(() => undefined);
+        }),
+        localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
+      ]);
     }
   } finally {
     await preparedRuntimeConfig.cleanup();
