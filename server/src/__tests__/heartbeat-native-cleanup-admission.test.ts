@@ -16,6 +16,7 @@ import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordin
 import { writeEnvironmentCleanup } from "../services/environment-cleanup-notifications.js";
 import { registerRunDispatchWork } from "../services/heartbeat/dispatch-work.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
+import { hasPendingRunCleanup } from "../services/execution-blocker.js";
 
 const execute = vi.hoisted(() => vi.fn());
 vi.mock("../adapters/index.js", async () => {
@@ -175,7 +176,7 @@ suite("native terminal-run cleanup admission", () => {
     }, 30_000,
   );
 
-  it("serializes a real legacy comment wake across terminal cleanup and final executor release", async () => {
+  it.each(["normal teardown", "failed final teardown"] as const)("serializes a real legacy comment wake across %s", async mode => {
     const home = createIsolatedTestHome(), previousHome = process.env.PAPERCLIP_HOME;
     process.env.PAPERCLIP_HOME = home.home;
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), ownerId = randomUUID();
@@ -192,6 +193,14 @@ suite("native terminal-run cleanup admission", () => {
     const cleanupGate = new Promise<void>(resolve => { finishCleanup = resolve; });
     const committed = new Promise<void>(resolve => { cleanupCommitted = resolve; });
     const executorGate = new Promise<void>(resolve => { finishExecutor = resolve; });
+    const boundary = async (signal: Promise<void>, label: string) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([signal, new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), 10_000);
+        })]);
+      } finally { clearTimeout(timer); }
+    };
     const runtime = environmentRuntimeService(db), releaseLeases = runtime.releaseRunLeases.bind(runtime);
     let sourceId = "", leaseId = "", successorId = "";
     const boundaries: string[] = [];
@@ -225,9 +234,22 @@ suite("native terminal-run cleanup admission", () => {
       return { exitCode: 0, signal: null, timedOut: false, summary: "Turn completed" };
     });
     const heartbeat = heartbeatService(db, { environmentRuntime: runtime });
+    let faultInstalled = false;
     try {
       await heartbeat.invoke(agentId, "on_demand", { issueId }, "manual");
-      await releaseEntered;
+      await boundary(releaseEntered, "terminal predecessor entering cleanup");
+      if (mode === "failed final teardown") {
+        await db.execute(sql`create table test_legacy_teardown_failure (run_id uuid primary key)`);
+        await db.execute(sql`insert into test_legacy_teardown_failure values (${sourceId})`);
+        await db.execute(sql`create function test_fail_legacy_teardown() returns trigger language plpgsql as $$ begin
+          if new.controller_lease_expires_at is null and old.controller_lease_expires_at is not null
+            and exists (select 1 from test_legacy_teardown_failure where run_id = new.id) then
+            raise exception 'Final controller teardown write unavailable';
+          end if; return new; end $$`);
+        await db.execute(sql`create trigger test_fail_legacy_teardown before update on heartbeat_runs
+          for each row execute function test_fail_legacy_teardown()`);
+        faultInstalled = true;
+      }
       // A new user request reopens the completed task before its comment wake.
       await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
       await heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system", reason: "issue_commented",
@@ -238,7 +260,8 @@ suite("native terminal-run cleanup admission", () => {
       successorId = successors[0].id;
       expect(successors[0]).toMatchObject({ status: "queued", retryOfRunId: null });
       finishCleanup();
-      await committed;
+      await boundary(committed, "committed lease cleanup");
+      expect(await hasPendingRunCleanup(db, companyId, sourceId)).toBe(false);
       // Simulate notification delivery before the original executor's finally ends.
       await heartbeat.resumeQueuedRunsAfterDrain({ companyId });
       expect((await heartbeat.getRun(successorId))?.status).toBe("queued");
@@ -252,6 +275,11 @@ suite("native terminal-run cleanup admission", () => {
     } finally {
       finishCleanup(); finishExecutor();
       await heartbeat.drainActiveRunExecutions();
+      if (faultInstalled) {
+        await db.execute(sql`drop trigger test_fail_legacy_teardown on heartbeat_runs`);
+        await db.execute(sql`drop function test_fail_legacy_teardown()`);
+        await db.execute(sql`drop table test_legacy_teardown_failure`);
+      }
       if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
       home.cleanup();
     }

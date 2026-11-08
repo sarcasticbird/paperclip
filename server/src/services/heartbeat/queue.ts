@@ -2126,11 +2126,20 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       if (claimedRuns.length === 0) return [];
 
       for (const claimedRun of claimedRuns) {
-        const execution = executeRun(claimedRun.id).catch((err) => {
+        const execution = executeRun(claimedRun.id).catch(async (err) => {
           logger.error(
             { err, runId: claimedRun.id },
             "queued heartbeat execution failed",
           );
+          // Teardown can reject after the executor relinquishes ownership but
+          // before its ordinary completion promotion. A cleanup notification
+          // may already have been consumed while that executor still held its
+          // slot. Reconsider existing queued work; never replay the failed run.
+          // Normal admission still holds unresolved cleanup and running owners.
+          await startNextQueuedRunForAgent(claimedRun.agentId).catch((admissionError) => {
+            logger.error({ err: admissionError, runId: claimedRun.id, agentId: claimedRun.agentId },
+              "failed to reconsider queued work after heartbeat execution failure");
+          });
         });
         // Register the in-flight execution so drainActiveRunExecutions() can await
         // it. executeRun resolves only after its finally block finishes flushing
