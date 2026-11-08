@@ -1909,6 +1909,15 @@ unpriced-usage policy by itself, and neither does an unpriced charge with a
 known partial cost or with no observed tokens on metered billing. A task's own
 continuation and finalization are never held by that task's pending
 accounting.
+Remote CLI-adapter runs use the same incomplete-settlement owner after a terminal
+failure, cancellation, timeout or interruption: their controller lease and control
+deadline must be cleared, no process identity may remain, no future retry may be
+scheduled, and every allocation must carry its exact company/run/lease-bound
+termination receipt. Terminal status or a missing PID alone is not closure proof.
+Existing saved adapter runs with that evidence are eligible without relabeling
+their runtime or rewriting their history. Their final usage remains incomplete;
+known cost is an explicit lower-bound estimate and later complete receipts still
+reconcile through the normal ledger. Local or unproven producers retain the hold.
 A controller that detaches for server restart loses checkpoint and completion
 write authority. A closing event stream is not proof that the governed run
 finished; the replacement controller must adopt and settle the original run.

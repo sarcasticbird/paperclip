@@ -96,7 +96,24 @@ const closedNativeReceiptSource = sql`${heartbeatRuns.runtimeMode} = 'native'
         and process_event.source_event_id is null
         and process_event.event_type in ('native.process_start_requested', 'native.process_identity_recorded', 'native.local_process_stopped')
       order by process_event.seq desc limit 1) = 'native.local_process_stopped')
-    or (${heartbeatRuns.status} in ('failed', 'cancelled', 'timed_out', 'interrupted') and ${remoteExecutionTerminated}))`;
+     or (${heartbeatRuns.status} in ('failed', 'cancelled', 'timed_out', 'interrupted') and ${remoteExecutionTerminated}))`;
+
+/** Remote CLI adapters have no native finalization coordinator. Their failed
+ * invocation is closed only after controller/process authority ended and every
+ * allocation has the same positive run/lease-bound termination proof. This is
+ * permission to account observed usage as an incomplete lower bound, never a
+ * claim that the missing final receipt arrived. Local/unknown producers stay held. */
+const closedAdapterReceiptSource = sql`${heartbeatRuns.runtimeMode} = 'legacy'
+  and ${heartbeatRuns.status} in ('failed', 'cancelled', 'timed_out', 'interrupted')
+  and ${heartbeatRuns.finishedAt} is not null
+  and ${heartbeatRuns.controllerLeaseExpiresAt} is null
+  and ${heartbeatRuns.executionControlDeadlineAt} is null
+  and ${heartbeatRuns.processPid} is null and ${heartbeatRuns.processGroupId} is null
+  and ${heartbeatRuns.processStartedAt} is null
+  and (${heartbeatRuns.scheduledRetryAt} is null or ${heartbeatRuns.scheduledRetryAt} <= ${heartbeatRuns.finishedAt})
+  and ${remoteExecutionTerminated}`;
+
+const closedReceiptSource = sql`(${closedNativeReceiptSource}) or (${closedAdapterReceiptSource})`;
 
 /** A native run whose provider never started has nothing to account: recovery
  * settled, not one usage receipt was ever journaled for the run (a provider
@@ -163,8 +180,8 @@ async function captureFailureSettles(db: Db, runId: string): Promise<boolean> {
   return row?.due === true;
 }
 
-async function readNativeReceiptClosure(db: Db, runId: string) {
-  const [row] = await db.select({ closed: sql<boolean>`${closedNativeReceiptSource}`,
+async function readReceiptClosure(db: Db, runId: string) {
+  const [row] = await db.select({ closed: sql<boolean>`${closedReceiptSource}`,
     timedOut: sql<boolean>`${closureEvidenceTimedOut()}`, neverStarted: sql<boolean>`${nativeProviderWorkNeverStarted}` }).from(heartbeatRuns)
     .where(eq(heartbeatRuns.id, runId));
   if (row?.neverStarted === true) return "no_provider_work" as const;
@@ -275,7 +292,7 @@ export async function accountRunCost(db: Db, runId: string, hooks: BudgetService
     const captureFailed = object(run.usageJson).accountingCaptureFailed === true;
     if (captureFailed && !await captureFailureSettles(tx, run.id)) return false;
     const providerWorkNeverStarted = !captureFailed && run.runtimeMode === "native" && object(run.usageJson).accountingReceiptReady === false
-      && await readNativeReceiptClosure(tx, run.id) === "no_provider_work";
+      && await readReceiptClosure(tx, run.id) === "no_provider_work";
     const preProviderFailure = !captureFailed && (object(object(run.resultJson).executionRecovery).providerWorkStarted === false
       || object(run.usageJson).accountingProviderWorkStarted === false || providerWorkNeverStarted);
     // A failed native turn is not necessarily the end of this heartbeat: the
@@ -293,7 +310,7 @@ export async function accountRunCost(db: Db, runId: string, hooks: BudgetService
     // still posts through late-receipt reconciliation.
     const receiptUnavailable = !preProviderFailure && (captureFailed || object(run.usageJson).accountingReceiptReady === false);
     const receiptClosure = captureFailed ? "timed_out" as const
-      : receiptUnavailable ? await readNativeReceiptClosure(tx, run.id) : null;
+      : receiptUnavailable ? await readReceiptClosure(tx, run.id) : null;
     if (receiptUnavailable && !receiptClosure) return false;
     const closureTimedOut = receiptClosure === "timed_out";
     if (!preProviderFailure) await ensureRuntimeAccountingBaseline(tx, run.companyId, run.agentId);
@@ -444,7 +461,7 @@ function actionableRunAccounting(at: Date = new Date()) {
           and ${heartbeatRuns.runtimeMode} = 'native' and ${nativeRunFinalizations.resultId} is null
           and ${nativeRunFinalizations.phase} <> 'terminal_failure'))`,
         sql`(${heartbeatRuns.usageJson}->>'accountingReceiptReady' is distinct from 'false' or ${heartbeatRuns.resultJson}->'executionRecovery'->>'providerWorkStarted' = 'false' or ${heartbeatRuns.usageJson}->>'accountingProviderWorkStarted' = 'false'
-          or (${closedNativeReceiptSource}) or (${closureEvidenceTimedOut(at)}) or (${nativeProviderWorkNeverStarted}))`,
+          or (${closedReceiptSource}) or (${closureEvidenceTimedOut(at)}) or (${nativeProviderWorkNeverStarted}))`,
       )),
     )),
   );

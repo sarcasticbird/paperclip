@@ -1,15 +1,31 @@
 import { notifyActiveExecutionRecovery, notifyLiveRunRecovery } from "./live-run-recovery-notifications.js";
-import { and, eq, gt, lte, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, lte, sql } from "drizzle-orm";
 import { heartbeatRuns, livenessDb, type Db } from "@paperclipai/db";
 import type { LegacyControllerLeaseLossCause, LegacyControllerLeaseLossTiming } from "./run-cancellation.js";
 import { randomUUID } from "node:crypto";
 import { currentControllerBootId } from "./controller-process-identity.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 
 // A boot UUID has meaning across containers; a numeric PID does not. Legacy
 // leases stamp the single process boot id shared with native claims.
 export const legacyControllerBootId = currentControllerBootId();
 export const LEGACY_CONTROLLER_LEASE_MS = 60_000;
 export const LEGACY_CONTROLLER_RENEW_MS = 10_000;
+
+/** Executor teardown releases only its own terminal invocation. Lease cleanup
+ * can notify accounting before this last authority fence clears, so register
+ * accounting intent in the same transaction as the release, not before commit. */
+export async function settleTerminalLegacyController(db: Db, run: { id: string; companyId: string }) {
+  return db.transaction(async tx => {
+    await notifyDeliveryWork(tx, DELIVERY_QUEUES.accounting, run.companyId);
+    await tx.update(heartbeatRuns).set({
+      executionStage: sql`case when ${heartbeatRuns.status} = 'cancelled' then 'settled' else ${heartbeatRuns.executionStage} end`,
+      controllerLeaseExpiresAt: null,
+    }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+      eq(heartbeatRuns.runtimeMode, "legacy"), eq(heartbeatRuns.controllerBootId, legacyControllerBootId),
+      inArray(heartbeatRuns.status, ["succeeded", "failed", "cancelled", "timed_out", "interrupted"])));
+  });
+}
 
 type Run = typeof heartbeatRuns.$inferSelect;
 

@@ -288,6 +288,7 @@ import {
 import {
   legacyControllerBootId,
   watchLegacyControllerLease,
+  settleTerminalLegacyController,
 } from "./legacy-controller-lease.js";
 import { retryChatControlAdmission } from "./chat-control-admission-retry.js";
 
@@ -4056,12 +4057,7 @@ export function heartbeatService(
             logger.warn({ err: error, runId: run.id }, "failed to acknowledge Stop after native process settlement");
           });
         }
-        await db.update(heartbeatRuns).set({
-          executionStage: sql`case when ${heartbeatRuns.status} = 'cancelled' then 'settled' else ${heartbeatRuns.executionStage} end`,
-          controllerLeaseExpiresAt: null,
-        }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.runtimeMode, "legacy"),
-          eq(heartbeatRuns.controllerBootId, legacyControllerBootId),
-          inArray(heartbeatRuns.status, ["succeeded", "failed", "cancelled", "timed_out", "interrupted"])));
+        await settleTerminalLegacyController(db, run);
 
         latestRun = await getRun(run.id).catch(() => null);
         if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status) && !isNativeRunnerOwnershipHeld(latestRun)) {
