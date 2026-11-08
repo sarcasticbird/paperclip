@@ -2465,6 +2465,29 @@ configuration variables; task bindings cannot override them.
 
 When effective run config changes, Paperclip may intentionally skip a saved adapter session, refresh persisted workspace runtime config, replace a reused execution workspace, or avoid reusing a sandbox/environment lease. Fresh execution can lose adapter-specific session, workspace, or sandbox state; correctness of the next run's config takes priority over continuity. Plain environment values affect freshness through value hashes; run result JSON and workspace operation logs expose only the non-sensitive freshness decision categories, without storing secret values, full env maps, provider credentials, or private path details.
 
+Legacy sandbox adapters may continue a saved session across a new ownership lease
+only when Core verifies the immediate reusable-lease handoff from authoritative
+rows. Both reciprocal receipts, the same company/agent/task/workspace/environment
+and provider allocation, a resumed acquisition, terminal predecessor run, and a
+separate exact `stopped` receipt are required. Destroyed allocations, missing stop
+evidence, or ambiguous bindings grant no extra match. Existing exact-lease,
+provider, environment and remote-directory checks remain in force. This applies
+to built-in and plugin sandbox providers without provider-specific exceptions.
+
+The extra continuation authority is host-only and nonserializable. Saved adapter
+session identities still contain the current lease ID: previous-release sessions
+keep their existing shape, and no migration is required. The shared session-codec
+boundary preserves the credential-free remote execution identity independently
+of provider codecs, on both save and load. Previously saved sessions whose codec
+already discarded that identity are not reconstructed by guessing: their next
+remote turn still starts fresh, then saves a complete identity for later turns.
+A third turn accepts its
+immediate predecessor, not every ancestor. Reconstructing the execution target
+after restart re-verifies the database evidence. Older release paths that did not
+record stop evidence retain their existing fresh-session behavior; no historical
+termination evidence is invented. This does not qualify provider-specific session
+restoration or native harness compatibility; those require live follow-up tests.
+
 An explicit `reuse_existing` Git workspace keeps its recorded source repository, including after its project-workspace row is deleted or the project primary changes. The server verifies the original company, project, repository origin, and worktree registration before reuse. It does not attach a deleted association to the new primary. A conflicting explicit project-workspace selection, missing source identity, or an unverified legacy local checkout blocks the run. Restore the original source. Before intentionally clearing the existing-workspace binding to choose a new repository, review and preserve its retained work. Missing worktrees may be reconstructed only from the verified original source; current project defaults are not a fallback.
 
 ### Isolated repository object cache

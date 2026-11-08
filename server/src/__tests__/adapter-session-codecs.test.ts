@@ -14,8 +14,24 @@ import {
   isOpenCodeUnknownSessionError,
 } from "@paperclipai/adapter-opencode-local/server";
 import { sessionCodec as acpxSessionCodec } from "@paperclipai/adapter-utils/acpx-engine/session-codec";
+import { getAdapterSessionCodec } from "../services/heartbeat/run-state.js";
 
 describe("adapter session codecs", () => {
+  it.each(["opencode_local", "claude_local", "codex_local"])("preserves shared local/SSH/sandbox identity through the server codec for %s", adapterType => {
+    const codec = getAdapterSessionCodec(adapterType);
+    const local = { sessionId: "provider-session", cwd: "/workspace/project" };
+    expect(codec.deserialize(codec.serialize(local))).toEqual(local);
+    for (const remoteExecution of [
+      { transport: "ssh", host: "host.example", port: 22, username: "guest", remoteCwd: "/workspace/project" },
+      { transport: "sandbox", providerKey: "provider", environmentId: "environment", leaseId: "lease", remoteCwd: "/workspace/project" },
+    ]) {
+      const params = { ...local, remoteExecution };
+      expect(codec.deserialize(codec.serialize(params))).toEqual(params);
+    }
+    expect(codec.serialize(null)).toBeNull();
+    expect(codec.deserialize(null)).toBeNull();
+  });
+
   it("normalizes claude session params with cwd", () => {
     const parsed = claudeSessionCodec.deserialize({
       session_id: "claude-session-1",

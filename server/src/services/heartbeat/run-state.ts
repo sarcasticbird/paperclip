@@ -34,6 +34,7 @@ import {
 import { notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { getServerAdapter } from "../../adapters/index.js";
+import { withExecutionTargetSessionIdentity } from "@paperclipai/adapter-utils/execution-target-session-codec";
 import type {
   AdapterExecutionResult,
   AdapterSessionCodec,
@@ -876,7 +877,7 @@ const defaultSessionCodec: AdapterSessionCodec = {
 
 export function getAdapterSessionCodec(adapterType: string) {
   const adapter = getServerAdapter(adapterType);
-  return adapter.sessionCodec ?? defaultSessionCodec;
+  return withExecutionTargetSessionIdentity(adapter.sessionCodec ?? defaultSessionCodec);
 }
 
 export function normalizeSessionParams(

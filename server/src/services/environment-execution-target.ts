@@ -4,6 +4,7 @@ import type { Environment, EnvironmentLease } from "@paperclipai/shared";
 import { adapterSupportsRemoteManagedEnvironments } from "@paperclipai/shared";
 import {
   adapterExecutionTargetToRemoteSpec,
+  adapterSandboxSessionContinuation,
   type AdapterExecutionTarget,
   type SandboxLeaseAcquisition,
 } from "@paperclipai/adapter-utils/execution-target";
@@ -20,6 +21,7 @@ import { getStartupTracer } from "../instrumentation.js";
 import { resolveEnvironmentDriverConfigForRuntime } from "./environment-config.js";
 import type { EnvironmentRuntimeService } from "./environment-runtime.js";
 import { getEnvironmentDriverTraits } from "./environment-driver-traits.js";
+import { resolveSandboxSessionPredecessor } from "./environment-session-continuity.js";
 
 export const DEFAULT_SANDBOX_REMOTE_CWD = "/tmp";
 
@@ -397,10 +399,17 @@ export async function resolveEnvironmentExecutionTarget(input: {
       }
     }
 
+    const sessionPredecessor = input.lease?.metadata?.reusableLeasePredecessor &&
+      input.leaseId && input.environment.id && parsed.config.reuseLease === true
+      ? await resolveSandboxSessionPredecessor(input.db, {
+          companyId: input.companyId, environmentId: input.environment.id,
+          provider: parsed.config.provider, leaseId: input.leaseId, lease: input.lease,
+        }) : null;
     return {
       kind: "remote",
       transport: "sandbox",
       providerKey: parsed.config.provider,
+      ...adapterSandboxSessionContinuation(input.leaseId ?? "", sessionPredecessor),
       shellCommand,
       remoteCwd,
       enableSandboxDuplexBridge,

@@ -181,6 +181,20 @@ export interface SandboxLeaseAcquisition {
   reason?: "not_found" | "expired" | "identity_mismatch" | "resume_failed";
 }
 
+// Core alone verifies the reciprocal lease handoff. A private symbol prevents
+// serialized target/metadata inputs from granting continuation authority. Keep
+// it enumerable so trusted target copies (including cwd overrides) retain it.
+const sandboxSessionContinuation = Symbol("sandboxSessionContinuation");
+
+export function adapterSandboxSessionContinuation(
+  currentLeaseId: string,
+  previousLeaseId: string | null,
+) {
+  return previousLeaseId ? {
+    [sandboxSessionContinuation]: Object.freeze({ currentLeaseId, previousLeaseId }),
+  } : {};
+}
+
 export interface AdapterSandboxExecutionTarget extends AdapterExecutionTargetWorkspaceMetadata {
   kind: "remote";
   transport: "sandbox";
@@ -216,6 +230,7 @@ export interface AdapterSandboxExecutionTarget extends AdapterExecutionTargetWor
   shellCommand?: "bash" | "sh" | null;
   environmentId?: string | null;
   leaseId?: string | null;
+  readonly [sandboxSessionContinuation]?: Readonly<{ currentLeaseId: string; previousLeaseId: string }>;
   remoteCwd: string;
   timeoutMs?: number | null;
   runner?: CommandManagedRuntimeRunner;
@@ -1386,11 +1401,17 @@ export function adapterExecutionTargetSessionMatches(
   if (target.transport === "ssh") return remoteExecutionSessionMatches(saved, target.spec);
   const current = adapterExecutionTargetSessionIdentity(target);
   const parsedSaved = parseObject(saved);
+  const savedLeaseId = readStringMeta(parsedSaved, "leaseId");
+  const continuation = target[sandboxSessionContinuation];
+  const leaseMatches = savedLeaseId === current?.leaseId || Boolean(
+    savedLeaseId && continuation?.currentLeaseId === current?.leaseId &&
+    continuation?.previousLeaseId === savedLeaseId,
+  );
   return (
     readStringMeta(parsedSaved, "transport") === current?.transport &&
     readStringMeta(parsedSaved, "providerKey") === current?.providerKey &&
     readStringMeta(parsedSaved, "environmentId") === current?.environmentId &&
-    readStringMeta(parsedSaved, "leaseId") === current?.leaseId &&
+    leaseMatches &&
     readStringMeta(parsedSaved, "remoteCwd") === current?.remoteCwd
   );
 }
