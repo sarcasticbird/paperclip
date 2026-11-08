@@ -67,6 +67,24 @@ const blockerRunFields = {
   runnerProfileJson: blockerProfileColumn,
 };
 
+/** Shared lease-state predicate; recovery stop receipts are checked separately. */
+export function pendingEnvironmentLeaseCleanupPredicate(runtimeMode: SQL) {
+  return sql`(( ${environmentLeases.releasedAt} IS NULL AND NOT COALESCE(
+      ${environmentLeases.status} = 'retained' AND ${environmentLeases.leasePolicy} = 'reuse_by_environment'
+        AND ${environmentLeases.cleanupStatus} = 'success', false))
+    OR ${environmentLeases.status} IN ('active', 'pending_cleanup') OR ${environmentLeases.cleanupStatus} = 'failed'
+    OR COALESCE(${environmentLeases.metadata}->>'pendingCleanupInFlight', 'false') <> 'false'
+    OR (${runtimeMode} = 'native' AND NOT COALESCE(
+      (${environmentLeases.status} IN ('released', 'expired', 'failed')
+        AND ${environmentLeases.releasedAt} IS NOT NULL AND (${environmentLeases.cleanupStatus} = 'success'
+          OR (${environmentLeases.cleanupStatus} IS NULL AND (
+            (${environmentLeases.provider} = 'local' AND ${environmentLeases.providerLeaseId} IS NULL)
+            OR (${environmentLeases.provider} = 'ssh' AND ${environmentLeases.metadata}->>'driver' = 'ssh'
+              AND ${environmentLeases.providerLeaseId} LIKE 'ssh://%')))))
+      OR (${environmentLeases.status} = 'retained' AND ${environmentLeases.leasePolicy} = 'reuse_by_environment'
+        AND ${environmentLeases.cleanupStatus} = 'success'), false)))`;
+}
+
 export async function hasPendingRunCleanup(db: Db, companyId: string, runId: string): Promise<boolean> {
   if (await nativeManualAdmissionHoldsExecution(db, { companyId, runId })) return true;
   // Recovery saved the files and re-stopped this sandbox before queueing its
@@ -80,20 +98,7 @@ export async function hasPendingRunCleanup(db: Db, companyId: string, runId: str
     OR EXISTS (SELECT 1 FROM ${environmentLeases}
       WHERE ${environmentLeases.companyId} = ${companyId} AND ${environmentLeases.heartbeatRunId} = ${runId}
         ${recoveredStopped.length ? sql`AND ${environmentLeases.id}::text NOT IN (${sql.join(recoveredStopped.map(id => sql`${id}`), sql`, `)})` : sql``}
-        AND (( ${environmentLeases.releasedAt} IS NULL AND NOT COALESCE(
-            ${environmentLeases.status} = 'retained' AND ${environmentLeases.leasePolicy} = 'reuse_by_environment'
-              AND ${environmentLeases.cleanupStatus} = 'success', false))
-          OR ${environmentLeases.status} IN ('active', 'pending_cleanup') OR ${environmentLeases.cleanupStatus} = 'failed'
-          OR COALESCE(${environmentLeases.metadata}->>'pendingCleanupInFlight', 'false') <> 'false'
-          OR (${heartbeatRuns.runtimeMode} = 'native' AND NOT COALESCE(
-            (${environmentLeases.status} IN ('released', 'expired', 'failed')
-              AND ${environmentLeases.releasedAt} IS NOT NULL AND (${environmentLeases.cleanupStatus} = 'success'
-                OR (${environmentLeases.cleanupStatus} IS NULL AND (
-                  (${environmentLeases.provider} = 'local' AND ${environmentLeases.providerLeaseId} IS NULL)
-                  OR (${environmentLeases.provider} = 'ssh' AND ${environmentLeases.metadata}->>'driver' = 'ssh'
-                    AND ${environmentLeases.providerLeaseId} LIKE 'ssh://%')))))
-            OR (${environmentLeases.status} = 'retained' AND ${environmentLeases.leasePolicy} = 'reuse_by_environment'
-              AND ${environmentLeases.cleanupStatus} = 'success'), false))))
+        AND ${pendingEnvironmentLeaseCleanupPredicate(sql`${heartbeatRuns.runtimeMode}`)})
     OR EXISTS (SELECT 1 FROM ${nativeRunFinalizations}
       WHERE ${nativeRunFinalizations.companyId} = ${companyId} AND ${nativeRunFinalizations.runId} = ${runId}
         AND (${nativeRunFinalizations.leaseOwner} IS NOT NULL

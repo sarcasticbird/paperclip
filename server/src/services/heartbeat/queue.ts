@@ -50,7 +50,7 @@ import {
   undeliveredLegacyUserCommentIds,
 } from "../explicit-native-continuation.js";
 import { canRetryStoppedRun } from "../cancelled-native-startup.js";
-import { getExecutionBlocker, hasPendingRunCleanup } from "../execution-blocker.js";
+import { getExecutionBlocker, hasPendingRunCleanup, pendingEnvironmentLeaseCleanupPredicate } from "../execution-blocker.js";
 import { nativeManualAdmissionHoldsExecution } from "../native-runtime/native-runner-ownership.js";
 import { taskChatRetrySourceCleanupPending } from "../chat-channels/task-retry-authority.js";
 import { validateNativeWorkspaceReconstruction } from "../native-runtime/native-workspace-reconstruction.js";
@@ -102,6 +102,7 @@ import {
   chatEndpoints,
   companies,
   executionWorkspaces,
+  environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
@@ -177,6 +178,7 @@ import {
 } from "../agent-invokability.js";
 import { supportsUnscopedTimerHeartbeat } from "../heartbeat-policy.js";
 import { isUuidLike } from "@paperclipai/shared";
+import { HEARTBEAT_RUN_TERMINAL_STATUSES } from "./recovery.js";
 import { retryChatControlAdmission } from "../chat-control-admission-retry.js";
 
 import type { HeartbeatServiceOptions } from "../heartbeat.js";
@@ -217,7 +219,7 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
   activeRunExecutions: Set<string>;
   activeRunExecutionPromises: Set<Promise<void>>;
   activeWakeupPromises: Set<Promise<unknown>>;
-  liveRunExecutions: { has(id: string): boolean };
+  liveRunExecutions: { has(id: string): boolean; ids(): Iterable<string> };
   isHeartbeatRunTerminalStatus: (status: string | null | undefined) => boolean;
   isSameTaskScope: (left: string | null, right: string | null) => boolean;
   runTaskKey: (run: HeartbeatRun) => string | null;
@@ -548,6 +550,30 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         ),
       );
     return Number(count ?? 0);
+  }
+
+  async function countLegacyCleanupSlots(companyId: string, agentId: string) {
+    // Legacy terminal status is published before the executor's finally block
+    // saves the workspace and releases its sandbox. That owner still occupies
+    // an agent slot, even after a comment transfers the task claim and without
+    // retry provenance. Do not count native warm-session retention as execution.
+    const localOwners = [...liveRunExecutions.ids()];
+    const candidates = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId),
+      eq(heartbeatRuns.runtimeMode, "legacy"),
+      inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
+      or(localOwners.length ? inArray(heartbeatRuns.id, localOwners) : sql`false`,
+        sql`exists (select 1 from ${environmentLeases}
+          where ${environmentLeases.companyId} = ${heartbeatRuns.companyId}
+            and ${environmentLeases.heartbeatRunId} = ${heartbeatRuns.id}
+            and ${pendingEnvironmentLeaseCleanupPredicate(sql`${heartbeatRuns.runtimeMode}`)})`),
+    ));
+    let occupied = 0;
+    for (const candidate of candidates) {
+      if (liveRunExecutions.has(candidate.id) ||
+          await hasPendingRunCleanup(db, companyId, candidate.id)) occupied++;
+    }
+    return occupied;
   }
 
   async function withChatControlRecoveryGate(
@@ -1983,9 +2009,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       }
       const policy = parseHeartbeatPolicy(agent);
       const runningCount = await countRunningRunsForAgent(agentId);
+      const cleanupCount = await countLegacyCleanupSlots(agent.companyId, agentId);
       const availableSlots = Math.max(
         0,
-        policy.maxConcurrentRuns - runningCount,
+        policy.maxConcurrentRuns - runningCount - cleanupCount,
       );
       if (availableSlots <= 0) return [];
 

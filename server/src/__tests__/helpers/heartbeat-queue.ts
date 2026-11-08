@@ -53,7 +53,7 @@ export function createHeartbeatQueueTestDependencies(db: Db): QueueTestDependenc
     activeRunExecutions: new Set<string>(),
     activeRunExecutionPromises: new Set<Promise<void>>(),
     activeWakeupPromises: new Set<Promise<unknown>>(),
-    liveRunExecutions: { has: vi.fn(() => false) },
+    liveRunExecutions: { has: vi.fn(() => false), ids: vi.fn(() => []) },
     isHeartbeatRunTerminalStatus: (status: string | null | undefined) => ["succeeded", "failed", "cancelled", "timed_out"].includes(status ?? ""),
     isSameTaskScope: (left: string | null, right: string | null) => left === right,
     runTaskKey: (run: Run) => typeof run.contextSnapshot?.issueId === "string" ? run.contextSnapshot.issueId : null,

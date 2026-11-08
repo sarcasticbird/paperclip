@@ -455,20 +455,23 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     return { company, agent, issue, wake, run };
   }
 
-  async function pendingPredecessorFixture() {
+  async function pendingPredecessorFixture(otherTask = false) {
     const f = await fixture("queued");
+    const sourceIssue = otherTask
+      ? (await db.insert(issues).values({ companyId: f.company.id, title: "Other task" }).returning())[0]
+      : f.issue;
     const [source] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id,
-      issueId: f.issue.id, status: "failed", runtimeMode: "legacy", finishedAt: new Date(),
+      issueId: sourceIssue.id, status: "failed", runtimeMode: "legacy", finishedAt: new Date(),
       executionStage: "preparing", errorCode: "adapter_failed",
       resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
-      contextSnapshot: { issueId: f.issue.id } }).returning();
-    const [lease] = await db.insert(environmentLeases).values({ companyId: f.company.id, issueId: f.issue.id,
+      contextSnapshot: { issueId: sourceIssue.id } }).returning();
+    const [lease] = await db.insert(environmentLeases).values({ companyId: f.company.id, issueId: sourceIssue.id,
       heartbeatRunId: source.id, provider: "daytona", providerLeaseId: crypto.randomUUID(), status: "active" }).returning();
     const [successor] = await db.update(heartbeatRuns).set({ retryOfRunId: source.id, responsibleUserId: "queue-test-user",
       contextSnapshot: { issueId: f.issue.id, source: "issue.continuation_recovery", retryOfRunId: source.id,
         wakeReason: "issue_continuation_needed" } }).where(eq(heartbeatRuns.id, f.run.id)).returning();
     const deps = callbacks(db);
-    deps.getAgent.mockResolvedValue(f.agent);
+    deps.getAgent.mockResolvedValue({ ...f.agent, runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } });
     return { ...f, source, lease, successor, deps, queue: createHeartbeatQueue(db, deps) };
   }
 
@@ -483,6 +486,105 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
       .where(eq(environmentLeases.id, lease.id));
     expect(await queue.claimQueuedRun(successor)).toMatchObject({ id: successor.id, status: "running" });
     expect(await queue.claimQueuedRun(successor)).toBeNull();
+  });
+
+  it("keeps a comment-triggered successor queued without retry provenance until legacy cleanup settles", async () => {
+    const f = await pendingPredecessorFixture();
+    const [successor] = await db.update(heartbeatRuns).set({ retryOfRunId: null,
+      contextSnapshot: { issueId: f.issue.id, source: "issue.comment", wakeReason: "issue_commented" },
+    }).where(eq(heartbeatRuns.id, f.successor.id)).returning();
+    // Comment admission has already transferred the issue claim to the successor.
+    // The terminal predecessor still owns its environment, independently of that claim.
+    expect(successor.retryOfRunId).toBeNull();
+    expect(await f.queue.startNextQueuedRunForAgent(f.agent.id)).toEqual([]);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successor.id)))[0].status).toBe("queued");
+    expect(f.deps.executeRun).not.toHaveBeenCalled();
+
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" })
+      .where(eq(environmentLeases.id, f.lease.id));
+    expect(await f.queue.startNextQueuedRunForAgent(f.agent.id)).toMatchObject([{ id: successor.id, status: "running" }]);
+    expect(await f.queue.startNextQueuedRunForAgent(f.agent.id)).toEqual([]);
+    expect(f.deps.executeRun).toHaveBeenCalledExactlyOnceWith(successor.id);
+  });
+
+  it.each(["failed cleanup", "pending cleanup", "local executor", "process-only owner", "another task", "cancelled predecessor", "unknown in-flight cleanup"] as const)(
+    "preserves the legacy execution slot through %s without retry provenance", async scenario => {
+      const f = await pendingPredecessorFixture(scenario === "another task");
+      await db.update(heartbeatRuns).set({ retryOfRunId: null }).where(eq(heartbeatRuns.id, f.successor.id));
+      if (scenario === "failed cleanup") {
+        await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "failed" })
+          .where(eq(environmentLeases.id, f.lease.id));
+      } else if (scenario === "pending cleanup") {
+        await db.update(environmentLeases).set({ status: "pending_cleanup" }).where(eq(environmentLeases.id, f.lease.id));
+      } else if (scenario === "local executor" || scenario === "process-only owner") {
+        await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" })
+          .where(eq(environmentLeases.id, f.lease.id));
+        if (scenario === "local executor") f.deps.activeRunExecutions.add(f.source.id);
+        f.deps.liveRunExecutions.ids.mockReturnValue([f.source.id]);
+        f.deps.liveRunExecutions.has.mockImplementation(id => id === f.source.id);
+      } else if (scenario === "unknown in-flight cleanup") {
+        await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success",
+          metadata: { pendingCleanupInFlight: "unknown" } }).where(eq(environmentLeases.id, f.lease.id));
+      } else if (scenario === "cancelled predecessor") {
+        await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, f.source.id));
+      }
+      expect(await f.queue.startNextQueuedRunForAgent(f.agent.id)).toEqual([]);
+      expect(f.deps.executeRun).not.toHaveBeenCalled();
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.successor.id)))[0].status).toBe("queued");
+    },
+  );
+
+  it.each(["other agent", "other company", "native retained session", "legacy retained environment"] as const)(
+    "does not consume a legacy cleanup slot for %s", async scenario => {
+      const f = await pendingPredecessorFixture();
+      await db.update(heartbeatRuns).set({ retryOfRunId: null }).where(eq(heartbeatRuns.id, f.successor.id));
+      if (scenario === "other agent" || scenario === "other company") {
+        const company = scenario === "other company"
+          ? (await db.insert(companies).values({ name: "Other tenant", issuePrefix: "OT" }).returning())[0]
+          : f.company;
+        const [other] = await db.insert(agents).values({ companyId: company.id, name: "Other owner", adapterType: "process" }).returning();
+        await db.update(heartbeatRuns).set({ companyId: company.id, agentId: other.id }).where(eq(heartbeatRuns.id, f.source.id));
+        await db.update(environmentLeases).set({ companyId: company.id }).where(eq(environmentLeases.id, f.lease.id));
+      } else {
+        await db.update(heartbeatRuns).set({ runtimeMode: scenario === "native retained session" ? "native" : "legacy" })
+          .where(eq(heartbeatRuns.id, f.source.id));
+        await db.update(environmentLeases).set({ status: "retained", leasePolicy: "reuse_by_environment", cleanupStatus: "success" })
+          .where(eq(environmentLeases.id, f.lease.id));
+      }
+      expect(await f.queue.startNextQueuedRunForAgent(f.agent.id)).toMatchObject([{ id: f.successor.id, status: "running" }]);
+      expect(f.deps.executeRun).toHaveBeenCalledExactlyOnceWith(f.successor.id);
+    },
+  );
+
+  it("does not inspect cleanup per historical settled retained run", async () => {
+    const f = await pendingPredecessorFixture();
+    await db.update(environmentLeases).set({ status: "retained", leasePolicy: "reuse_by_environment", cleanupStatus: "success" })
+      .where(eq(environmentLeases.id, f.lease.id));
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.successor.id));
+    for (let index = 0; index < 20; index++) {
+      const [source] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id,
+        status: "succeeded", runtimeMode: "legacy", finishedAt: new Date() }).returning();
+      await db.insert(environmentLeases).values({ companyId: f.company.id, heartbeatRunId: source.id,
+        provider: "daytona", status: "retained", leasePolicy: "reuse_by_environment", cleanupStatus: "success" });
+    }
+    const executeQuery = vi.spyOn(db, "execute");
+    try {
+      expect(await f.queue.startNextQueuedRunForAgent(f.agent.id)).toEqual([]);
+      // hasPendingRunCleanup uses execute() after its two prerequisite reads.
+      // Settled history must not cause even one such per-owner query.
+      expect(executeQuery).not.toHaveBeenCalled();
+    } finally {
+      executeQuery.mockRestore();
+    }
+  });
+
+  it("counts a legacy owner once across multiple leases and preserves configured concurrency", async () => {
+    const f = await pendingPredecessorFixture();
+    await db.update(heartbeatRuns).set({ retryOfRunId: null }).where(eq(heartbeatRuns.id, f.successor.id));
+    await db.insert(environmentLeases).values({ companyId: f.company.id, heartbeatRunId: f.source.id,
+      provider: "daytona", providerLeaseId: randomUUID(), status: "active" });
+    f.deps.getAgent.mockResolvedValue({ ...f.agent, runtimeConfig: { heartbeat: { maxConcurrentRuns: 2 } } });
+    expect(await f.queue.startNextQueuedRunForAgent(f.agent.id)).toMatchObject([{ id: f.successor.id, status: "running" }]);
   });
 
   it("keeps a retry queued after failed cleanup and until its local executor releases", async () => {

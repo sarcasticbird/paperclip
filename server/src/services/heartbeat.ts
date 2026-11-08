@@ -979,6 +979,9 @@ export function heartbeatService(
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
   const liveRunExecutions = {
+    ids() {
+      return new Set([...runningProcesses.keys(), ...activeRunExecutions]);
+    },
     has(id: string) {
       return runningProcesses.has(id) || activeRunExecutions.has(id);
     },

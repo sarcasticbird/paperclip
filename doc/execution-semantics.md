@@ -450,6 +450,15 @@ The active-lock lifecycle is part of the checkout contract:
 
 Stale-lock recovery is crash recovery, not a retry loop. Paperclip must not clear or adopt locks held by non-terminal runs. After stale cleanup, a checkout `409` should mean a real live owner, status/assignee mismatch, unresolved blocker, or active gate still prevents checkout. Agents must treat that `409` as an ownership conflict and stop rather than retrying the same checkout.
 
+A terminal legacy run with an active executor or unfinished environment cleanup
+continues to occupy one of its agent's execution slots. A comment-triggered
+successor cannot evade that concurrency limit by taking the task execution lock
+or omitting retry provenance. The slot also applies to another task for the same
+agent; multiple leases for one run count once. Successful retained-environment
+cleanup does not occupy a slot, and native warm-session ownership keeps its
+existing separate admission rules. Cleanup events reconsider queued work through
+normal admission without polling or replaying the predecessor.
+
 A queued retry waits for its same-company, same-task and same-agent predecessor
 to finish execution and cleanup, including when the task execution lock already
 names the retry. This also applies to failures before native runtime selection.

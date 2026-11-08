@@ -15,6 +15,7 @@ import { createIsolatedTestHome } from "./helpers/isolated-test-home.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { writeEnvironmentCleanup } from "../services/environment-cleanup-notifications.js";
 import { registerRunDispatchWork } from "../services/heartbeat/dispatch-work.js";
+import { environmentRuntimeService } from "../services/environment-runtime.js";
 
 const execute = vi.hoisted(() => vi.fn());
 vi.mock("../adapters/index.js", async () => {
@@ -81,8 +82,9 @@ suite("native terminal-run cleanup admission", () => {
     expect(execute).toHaveBeenCalledTimes(3);
   }, 30_000);
 
-  it.each(["continue", "stop", "reassign", "failed cleanup"] as const)(
-    "settles an automatic legacy retry from the committed cleanup event: %s", async mode => {
+  it.each((["retry", "comment"] as const).flatMap(source =>
+    (["continue", "stop", "reassign", "failed cleanup"] as const).map(mode => ({ source, mode }))))(
+    "settles a legacy $source successor from the committed cleanup event: $mode", async ({ source, mode }) => {
       const home = createIsolatedTestHome(), previousHome = process.env.PAPERCLIP_HOME;
       process.env.PAPERCLIP_HOME = home.home;
       const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sourceId = randomUUID();
@@ -104,12 +106,13 @@ suite("native terminal-run cleanup admission", () => {
       const [lease] = await db.insert(environmentLeases).values({ companyId, issueId, heartbeatRunId: sourceId,
         provider: "daytona", providerLeaseId: randomUUID(), status: "active" }).returning();
       await db.insert(agentWakeupRequests).values({ id: wakeId, companyId, agentId, source: "automation", triggerDetail: "system",
-        reason: "issue_continuation_needed", requestedByActorType: "system", status: "queued", runId: successorId,
+        reason: source === "comment" ? "issue_commented" : "issue_continuation_needed", requestedByActorType: "system", status: "queued", runId: successorId,
         payload: { issueId } });
       await db.insert(heartbeatRuns).values({ id: successorId, companyId, agentId, issueId, status: "queued", invocationSource: "automation",
-        responsibleUserId: ownerId, retryOfRunId: sourceId, wakeupRequestId: wakeId,
-        contextSnapshot: { issueId, retryOfRunId: sourceId, source: "issue.continuation_recovery",
-          wakeReason: "issue_continuation_needed", skipIssueComment: true } });
+        responsibleUserId: ownerId, retryOfRunId: source === "comment" ? null : sourceId, wakeupRequestId: wakeId,
+        contextSnapshot: { issueId, ...(source === "retry" ? { retryOfRunId: sourceId } : {}),
+          source: source === "comment" ? "issue.comment" : "issue.continuation_recovery",
+          wakeReason: source === "comment" ? "issue_commented" : "issue_continuation_needed", skipIssueComment: true } });
       await db.update(issues).set({ executionRunId: successorId, executionAgentNameKey: "continuation-worker", executionLockedAt: new Date() })
         .where(eq(issues.id, issueId));
       execute.mockReset();
@@ -171,6 +174,88 @@ suite("native terminal-run cleanup admission", () => {
       }
     }, 30_000,
   );
+
+  it("serializes a real legacy comment wake across terminal cleanup and final executor release", async () => {
+    const home = createIsolatedTestHome(), previousHome = process.env.PAPERCLIP_HOME;
+    process.env.PAPERCLIP_HOME = home.home;
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), ownerId = randomUUID();
+    const cwd = path.join(home.home, "handoff");
+    await mkdir(cwd, { recursive: true });
+    await db.insert(authUsers).values({ id: ownerId, name: "Owner", email: `${ownerId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
+    await db.insert(companies).values({ id: companyId, name: "Live cleanup handoff", issuePrefix: `H${companyId.slice(0, 6)}`, defaultResponsibleUserId: ownerId });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: ownerId, status: "active", membershipRole: "owner" });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Handoff worker", status: "idle", adapterType: "http",
+      adapterConfig: { cwd }, runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true, maxConcurrentRuns: 1 } } });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Handoff", status: "in_progress", assigneeAgentId: agentId, responsibleUserId: ownerId });
+    let entered!: () => void, finishCleanup!: () => void, cleanupCommitted!: () => void, finishExecutor!: () => void;
+    const releaseEntered = new Promise<void>(resolve => { entered = resolve; });
+    const cleanupGate = new Promise<void>(resolve => { finishCleanup = resolve; });
+    const committed = new Promise<void>(resolve => { cleanupCommitted = resolve; });
+    const executorGate = new Promise<void>(resolve => { finishExecutor = resolve; });
+    const runtime = environmentRuntimeService(db), releaseLeases = runtime.releaseRunLeases.bind(runtime);
+    let sourceId = "", leaseId = "", successorId = "";
+    const boundaries: string[] = [];
+    vi.spyOn(runtime, "releaseRunLeases").mockImplementation(async (...args) => {
+      if (args[0] !== sourceId) return releaseLeases(...args);
+      expect((await heartbeat.getRun(sourceId))?.status).toBe("succeeded");
+      entered();
+      await cleanupGate;
+      const released = await releaseLeases(...args);
+      await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" })
+        .where(eq(environmentLeases.id, leaseId)), { companyId, runId: sourceId });
+      cleanupCommitted();
+      await executorGate;
+      boundaries.push("predecessor cleanup finished");
+      return released;
+    });
+    execute.mockReset();
+    execute.mockImplementation(async (context: { runId: string }) => {
+      if (!sourceId) {
+        sourceId = context.runId;
+        const [lease] = await db.insert(environmentLeases).values({ companyId, issueId, heartbeatRunId: sourceId,
+          provider: "daytona", providerLeaseId: randomUUID(), status: "active" }).returning();
+        leaseId = lease.id;
+        boundaries.push("predecessor wrote");
+        await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      } else {
+        expect(context.runId).toBe(successorId);
+        boundaries.push("successor wrote");
+        await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      }
+      return { exitCode: 0, signal: null, timedOut: false, summary: "Turn completed" };
+    });
+    const heartbeat = heartbeatService(db, { environmentRuntime: runtime });
+    try {
+      await heartbeat.invoke(agentId, "on_demand", { issueId }, "manual");
+      await releaseEntered;
+      // A new user request reopens the completed task before its comment wake.
+      await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+      await heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system", reason: "issue_commented",
+        requestedByActorType: "user", requestedByActorId: ownerId,
+        contextSnapshot: { issueId, source: "issue.comment", skipIssueComment: true } });
+      const successors = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).filter(run => run.id !== sourceId);
+      expect(successors).toHaveLength(1);
+      successorId = successors[0].id;
+      expect(successors[0]).toMatchObject({ status: "queued", retryOfRunId: null });
+      finishCleanup();
+      await committed;
+      // Simulate notification delivery before the original executor's finally ends.
+      await heartbeat.resumeQueuedRunsAfterDrain({ companyId });
+      expect((await heartbeat.getRun(successorId))?.status).toBe("queued");
+      expect(execute).toHaveBeenCalledTimes(1);
+      finishExecutor();
+      await heartbeat.drainActiveRunExecutions();
+      const successor = await heartbeat.getRun(successorId);
+      expect(successor?.status).toBe("succeeded");
+      expect(execute).toHaveBeenCalledTimes(2);
+      expect(boundaries).toEqual(["predecessor wrote", "predecessor cleanup finished", "successor wrote"]);
+    } finally {
+      finishCleanup(); finishExecutor();
+      await heartbeat.drainActiveRunExecutions();
+      if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
+      home.cleanup();
+    }
+  }, 30_000);
 
   it("retries a failed startup intent through timer failure and drain before verified cancellation", async () => {
     const home = createIsolatedTestHome(), originalHome = process.env.PAPERCLIP_HOME;
