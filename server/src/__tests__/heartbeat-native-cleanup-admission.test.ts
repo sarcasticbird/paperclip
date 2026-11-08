@@ -176,7 +176,7 @@ suite("native terminal-run cleanup admission", () => {
     }, 30_000,
   );
 
-  it.each(["normal teardown", "failed final teardown"] as const)("serializes a real legacy comment wake across %s", async mode => {
+  it.each(["normal teardown", "failed final teardown", "shutdown during failed teardown"] as const)("serializes a real legacy comment wake across %s", async mode => {
     const home = createIsolatedTestHome(), previousHome = process.env.PAPERCLIP_HOME;
     process.env.PAPERCLIP_HOME = home.home;
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), ownerId = randomUUID();
@@ -238,7 +238,7 @@ suite("native terminal-run cleanup admission", () => {
     try {
       await heartbeat.invoke(agentId, "on_demand", { issueId }, "manual");
       await boundary(releaseEntered, "terminal predecessor entering cleanup");
-      if (mode === "failed final teardown") {
+      if (mode !== "normal teardown") {
         await db.execute(sql`create table test_legacy_teardown_failure (run_id uuid primary key)`);
         await db.execute(sql`insert into test_legacy_teardown_failure values (${sourceId})`);
         await db.execute(sql`create function test_fail_legacy_teardown() returns trigger language plpgsql as $$ begin
@@ -266,15 +266,18 @@ suite("native terminal-run cleanup admission", () => {
       await heartbeat.resumeQueuedRunsAfterDrain({ companyId });
       expect((await heartbeat.getRun(successorId))?.status).toBe("queued");
       expect(execute).toHaveBeenCalledTimes(1);
+      if (mode === "shutdown during failed teardown") await heartbeat.prepareHotRestartShutdown("SIGTERM");
       finishExecutor();
       await heartbeat.drainActiveRunExecutions();
       const successor = await heartbeat.getRun(successorId);
-      expect(successor?.status).toBe("succeeded");
-      expect(execute).toHaveBeenCalledTimes(2);
-      expect(boundaries).toEqual(["predecessor wrote", "predecessor cleanup finished", "successor wrote"]);
+      expect(successor?.status).toBe(mode === "shutdown during failed teardown" ? "queued" : "succeeded");
+      expect(execute).toHaveBeenCalledTimes(mode === "shutdown during failed teardown" ? 1 : 2);
+      expect(boundaries).toEqual(["predecessor wrote", "predecessor cleanup finished",
+        ...(mode === "shutdown during failed teardown" ? [] : ["successor wrote"])]);
     } finally {
       finishCleanup(); finishExecutor();
       await heartbeat.drainActiveRunExecutions();
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
       if (faultInstalled) {
         await db.execute(sql`drop trigger test_fail_legacy_teardown on heartbeat_runs`);
         await db.execute(sql`drop function test_fail_legacy_teardown()`);

@@ -225,6 +225,7 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
   runTaskKey: (run: HeartbeatRun) => string | null;
   filterZombieCoalesceTarget: <T extends { id: string; status: string }>(run: T | null, live: { has(id: string): boolean }) => T | null;
   getSchedulingSuppression: () => Promise<{ suppressed: boolean; reason: "worktree_instance" | "database_restore_in_progress" | "task_drain" | null }>;
+  isShutdownInProgress: () => boolean;
   canStartNewExternalBotWork: (agent: typeof agents.$inferSelect) => Promise<boolean>;
   executeRun: (runId: string) => Promise<void>;
   releaseIssueExecutionAndPromote: (run: Pick<HeartbeatRun, "id" | "companyId">, options?: { suppressImmediateRecovery?: boolean; resumeStrandedQueue?: boolean; deferredPostCommitEffects?: WakeQueuePostCommitEffect[] }) => Promise<unknown>;
@@ -2136,6 +2137,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // may already have been consumed while that executor still held its
           // slot. Reconsider existing queued work; never replay the failed run.
           // Normal admission still holds unresolved cleanup and running owners.
+          if (dependencies.isShutdownInProgress()) return;
           await startNextQueuedRunForAgent(claimedRun.agentId).catch((admissionError) => {
             logger.error({ err: admissionError, runId: claimedRun.id, agentId: claimedRun.agentId },
               "failed to reconsider queued work after heartbeat execution failure");
