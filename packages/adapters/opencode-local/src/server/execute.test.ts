@@ -11,6 +11,8 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async (importOriginal) =>
 import { ensureRemoteOpenCodeModelConfiguredAndAvailable, execute } from "./execute.js";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixtures/prompt-context";
+import { createPaperclipAssignmentReceipt } from "@paperclipai/adapter-utils/server-utils";
+import { sessionCodec } from "./index.js";
 
 const runProcessMock = vi.mocked(runAdapterExecutionTargetProcess);
 
@@ -86,6 +88,8 @@ describe("OpenCode local skill injection", () => {
     const commandPath = path.join(configHome, "fake-opencode-context");
     await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     const prompts: string[] = [];
+    const context = { ...createPromptContextFixture(), paperclipTaskMarkdownAssignmentUnchanged: "## Compact assignment\nPlan revision: approved-revision-2" };
+    const receipt = createPaperclipAssignmentReceipt(context, { companyId: "company-1", agentId: "agent-1", sessionId: "previous" });
     runProcessMock
       .mockReset()
       .mockResolvedValueOnce(probeResult({ stdout: JSON.stringify({ type: "error", error: "unknown session" }) }))
@@ -93,9 +97,9 @@ describe("OpenCode local skill injection", () => {
     await execute({
       runId: "run-context-fallback",
       agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
-      runtime: { sessionId: "previous", sessionParams: null, sessionDisplayId: null, taskKey: null },
+      runtime: { sessionId: "previous", sessionParams: { paperclipAssignmentReceipt: receipt }, sessionDisplayId: null, taskKey: null },
       config: { command: commandPath, cwd: configHome, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
-      context: createPromptContextFixture(),
+      context,
       onLog: async () => {},
       onMeta: async (meta) => { prompts.push(String(meta.prompt ?? "")); },
     });
@@ -105,6 +109,65 @@ describe("OpenCode local skill injection", () => {
     for (const prompt of prompts) expect(prompt).not.toContain("Execution contract:");
     expect(prompts[1]).toContain("You are agent agent-1 (OpenCode).");
     expect(prompts[1]).toContain("Connection tools:");
+  });
+
+  it("round-trips a delivered assignment and sends changed scope instead of replaying unchanged plans", async () => {
+    const commandPath = path.join(configHome, "fake-opencode-resume");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const context = { ...createPromptContextFixture(),
+      paperclipTaskMarkdownAssignmentUnchanged: "Current policy; approved plan revision-2 unchanged." };
+    const config = { command: commandPath, cwd: configHome, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } };
+    const agent = { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} };
+    const prompts: string[] = [];
+    const turn = async (params: Record<string, unknown> | null, mutateAfterSubmission = false) => {
+      runProcessMock.mockReset().mockResolvedValue(probeResult({ stdout: JSON.stringify({ type: "text", sessionID: "native-resume", part: { text: "Done" } }) }));
+      return execute({ runId: "resume-run", agent, config, context,
+        runtime: { sessionId: params ? "native-resume" : null, sessionParams: params, sessionDisplayId: null, taskKey: "issue-1" },
+        onLog: async () => {}, onMeta: async meta => {
+          prompts.push(String(meta.prompt));
+          if (mutateAfterSubmission) context.paperclipTaskMarkdownAssignment += "\nLate scope was not submitted.";
+        } });
+    };
+    const first = await turn(null);
+    const saved = sessionCodec.deserialize(sessionCodec.serialize(first.sessionParams ?? null));
+    expect(saved?.paperclipAssignmentReceipt).toMatchObject({ version: 1, sessionId: "native-resume" });
+    await turn(saved);
+    expect(prompts[0]).toContain("## Owned assignment");
+    expect(prompts[1]).toContain(context.paperclipTaskMarkdownAssignmentUnchanged);
+    expect(prompts[1]).not.toContain("## Owned assignment");
+    expect(prompts[1]).toContain("Change the final scope to the launch checklist.");
+    context.paperclipTaskMarkdownAssignment += "\nNew scope; approved revision-3 must be delivered.";
+    await turn(saved);
+    expect(prompts[2]).toContain("New scope; approved revision-3 must be delivered.");
+    const fourth = await turn(saved, true);
+    expect(prompts[3]).not.toContain("Late scope was not submitted.");
+    await turn(sessionCodec.deserialize(sessionCodec.serialize(fourth.sessionParams ?? null)));
+    expect(prompts[4]).toContain("Late scope was not submitted.");
+    expect(runProcessMock).toHaveBeenCalledOnce();
+  });
+
+  it("preserves old session parameters without manufacturing a receipt and drops foreign receipt identity", () => {
+    const saved = { session_id: "old-session", workdir: "/workspace/project" };
+    expect(sessionCodec.deserialize(sessionCodec.serialize(saved))).toEqual({ sessionId: "old-session", cwd: "/workspace/project" });
+    const context = { ...createPromptContextFixture(), paperclipTaskMarkdownAssignmentUnchanged: "Unchanged plan." };
+    const receipt = createPaperclipAssignmentReceipt(context, { companyId: "company-1", agentId: "agent-1", sessionId: "other-session" });
+    expect(sessionCodec.deserialize({ sessionId: "old-session", paperclipAssignmentReceipt: receipt })?.paperclipAssignmentReceipt).toBeUndefined();
+  });
+
+  it.each(["failed", "signal", "transport", "parsed-error", "timeout", "substituted-session"])("does not publish a new assignment receipt for %s", async fault => {
+    const commandPath = path.join(configHome, "fake-opencode-fault");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const context = { ...createPromptContextFixture(), paperclipTaskMarkdownAssignmentUnchanged: "Unchanged plan reference." };
+    const overrides = fault === "failed" ? { exitCode: 1 } : fault === "signal" ? { signal: "SIGTERM" } :
+      fault === "transport" ? { errorCode: "duplex_channel_lost" } : fault === "timeout" ? { timedOut: true } : {};
+    runProcessMock.mockReset().mockResolvedValue(probeResult({ ...overrides, stdout: JSON.stringify(
+      fault === "parsed-error" ? { type: "error", sessionID: "expected", error: "refused" } :
+        { type: "text", sessionID: fault === "substituted-session" ? "substitute" : "expected", part: { text: "Done" } }) }));
+    const result = await execute({ runId: "fault", agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      config: { command: commandPath, cwd: configHome, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+      context, runtime: { sessionId: "expected", sessionParams: { sessionId: "expected" }, sessionDisplayId: null, taskKey: "issue-1" }, onLog: async () => {} });
+    expect(result.sessionParams?.paperclipAssignmentReceipt).toBeUndefined();
+    expect(runProcessMock).toHaveBeenCalledOnce();
   });
 
   it("injects runtime skills into the configured child HOME", async () => {

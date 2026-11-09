@@ -7,6 +7,7 @@ import { eq } from "drizzle-orm";
 import { agents, agentTaskSessions, companies, createDb, environmentLeases, environments, executionWorkspaces, heartbeatRuns, issues } from "@paperclipai/db";
 import { adapterExecutionTargetSessionIdentity, adapterExecutionTargetSessionMatches, runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 import { execute } from "@paperclipai/adapter-opencode-local/server";
+import { createPaperclipAssignmentReceipt } from "@paperclipai/adapter-utils/server-utils";
 import { startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { environmentService } from "./environments.js";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
@@ -178,13 +179,21 @@ describe("sandbox session continuity from authoritative lease handoffs", () => {
     expect(adapterExecutionTargetSessionMatches(f.identity(f.previous.id), await f.resolve(f.current, false))).toBe(false);
   });
 
-  it("composes Core handoff verification, persisted OpenCode session state and the real adapter invocation", async () => {
+  it.each([false, true])("composes Core handoff verification, persisted OpenCode session state and the real adapter invocation (receipt=%s)", async hasReceipt => {
     const f = await fixture();
     const codec = getAdapterSessionCodec("opencode_local");
     const sessionId = "ses_persisted";
+    const context = {
+      paperclipIssue: { id: f.issue.id },
+      paperclipTaskMarkdownAssignment: "gh-sweep read-only full plan; no product effects.",
+      paperclipTaskMarkdownAssignmentUnchanged: "Current policy; unchanged plan revision available on demand.",
+      paperclipWake: { reason: "issue_commented", issue: { id: f.issue.id, status: "in_progress", workMode: "standard" } },
+    };
+    const delivery = createPaperclipAssignmentReceipt(context, { companyId: f.company.id, agentId: f.agent.id, sessionId });
     const first = resolveNextSessionState({ adapterType: "opencode_local", codec, outcome: "succeeded",
       adapterResult: { exitCode: 0, signal: null, timedOut: false, sessionId, sessionParams: {
         sessionId, cwd: "/workspace/project", remoteExecution: f.identity(f.previous.id),
+        ...(hasReceipt ? { paperclipAssignmentReceipt: delivery } : {}),
       } }, previousParams: null, previousDisplayId: null, previousLegacySessionId: null });
     const [stored] = await db.insert(agentTaskSessions).values({ companyId: f.company.id, agentId: f.agent.id,
       adapterType: "opencode_local", taskKey: f.issue.id, sessionParamsJson: first.params,
@@ -192,6 +201,7 @@ describe("sandbox session continuity from authoritative lease handoffs", () => {
     const [loaded] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.id, stored.id));
     const params = codec.deserialize(loaded.sessionParamsJson);
     expect(params?.remoteExecution).toEqual(f.identity(f.previous.id));
+    expect(params?.paperclipAssignmentReceipt).toEqual(hasReceipt ? delivery : undefined);
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "core-session-invocation-"));
     vi.stubEnv("XDG_CONFIG_HOME", root);
     const processMock = vi.mocked(runAdapterExecutionTargetProcess);
@@ -199,16 +209,21 @@ describe("sandbox session continuity from authoritative lease handoffs", () => {
       stdout: JSON.stringify({ type: "text", sessionID: sessionId, part: { text: "Done" } }),
       stderr: "", pid: null, startedAt: new Date().toISOString() } as never);
     try {
+      let prompt = "";
       const result = await execute({ runId: f.secondRun.id, agent: f.agent,
         runtime: { sessionId, sessionParams: params, sessionDisplayId: sessionId, taskKey: f.issue.id },
         executionTarget: await f.resolve(), config: { cwd: root, command: "opencode", model: "openai/test",
-          env: { OPENCODE_ALLOW_ALL_MODELS: "1" } }, context: {}, onLog: async () => {} });
+          env: { OPENCODE_ALLOW_ALL_MODELS: "1" } }, context, onLog: async () => {},
+          onMeta: async meta => { prompt = String(meta.prompt ?? ""); } });
       const args = processMock.mock.calls[0][3];
       expect(args[args.indexOf("--session") + 1]).toBe(sessionId);
       expect(result.sessionId).toBe(sessionId);
+      expect(prompt).toContain(hasReceipt ? context.paperclipTaskMarkdownAssignmentUnchanged : context.paperclipTaskMarkdownAssignment);
+      if (hasReceipt) expect(prompt).not.toContain(context.paperclipTaskMarkdownAssignment);
       const next = resolveNextSessionState({ adapterType: "opencode_local", codec, outcome: "succeeded",
         adapterResult: result, previousParams: params, previousDisplayId: first.displayId, previousLegacySessionId: first.legacySessionId });
       expect(codec.deserialize(next.params)?.remoteExecution).toEqual(f.identity(f.current.id));
+      expect(codec.deserialize(next.params)?.paperclipAssignmentReceipt).toEqual(delivery);
     } finally { vi.unstubAllEnvs(); await fs.rm(root, { recursive: true, force: true }); }
   });
 });

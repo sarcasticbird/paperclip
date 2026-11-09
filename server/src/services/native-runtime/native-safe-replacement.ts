@@ -687,7 +687,7 @@ export async function reconcileSafeNativeReplacements(
           "explicitUserContinuation", "wakeCommentId", "wakeCommentIds", "commentId",
           "commentIds", "latestCommentId", "resumeIntent", "followUpRequested",
           "paperclipWake", "paperclipWakeComment", "paperclipTaskMarkdown", "paperclipTaskMarkdownCompact",
-          "paperclipTaskMarkdownAssignment", "paperclipTaskMarkdownAssignmentCompact", "paperclipTurnContext",
+          "paperclipTaskMarkdownAssignment", "paperclipTaskMarkdownAssignmentCompact", "paperclipTaskMarkdownAssignmentUnchanged", "paperclipTurnContext",
         ]) delete predecessorContext[key];
         const context = {
           ...predecessorContext,

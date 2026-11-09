@@ -332,6 +332,12 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
     includeDescription: false,
     includeWakeComments: false,
   }) + chatCompletionInstruction(context);
+  const taskMarkdownAssignmentUnchanged = issueRef && !isConversation(issueContext)
+    ? assignmentPrefix + buildPaperclipTaskMarkdown({
+        ...taskMarkdownInput, taskPlan, includeDescription: false,
+        includeWakeComments: false, includePlanBody: false,
+      }) + chatCompletionInstruction(context)
+    : null;
   if (issueRef) {
     context.paperclipIssue = {
       id: issueRef.id,
@@ -369,6 +375,11 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
     delete context.paperclipTaskMarkdownAssignmentCompact;
   }
   context.paperclipTaskCommunicationGuidance = [context.paperclipTaskCommunicationGuidance, FAST_RESPONSE_AGENT_GUIDANCE].filter(Boolean).join("\n\n");
+  if (taskMarkdownAssignmentUnchanged) {
+    context.paperclipTaskMarkdownAssignmentUnchanged = taskMarkdownAssignmentUnchanged;
+  } else {
+    delete context.paperclipTaskMarkdownAssignmentUnchanged;
+  }
   if (issueRef) {
     const redactedWakeContext = await createRunSecretRedactionRegistry(
       db,
@@ -381,6 +392,7 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
       paperclipTaskMarkdownCompact: context.paperclipTaskMarkdownCompact,
       paperclipTaskMarkdownAssignment: context.paperclipTaskMarkdownAssignment,
       paperclipTaskMarkdownAssignmentCompact: context.paperclipTaskMarkdownAssignmentCompact,
+      paperclipTaskMarkdownAssignmentUnchanged: context.paperclipTaskMarkdownAssignmentUnchanged,
     });
     context.paperclipIssue = redactedWakeContext.paperclipIssue;
     if (redactedWakeContext.paperclipCase) context.paperclipCase = redactedWakeContext.paperclipCase;
@@ -404,6 +416,9 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
     if (redactedWakeContext.paperclipTaskMarkdownAssignmentCompact) {
       context.paperclipTaskMarkdownAssignmentCompact =
         redactedWakeContext.paperclipTaskMarkdownAssignmentCompact;
+    }
+    if (redactedWakeContext.paperclipTaskMarkdownAssignmentUnchanged) {
+      context.paperclipTaskMarkdownAssignmentUnchanged = redactedWakeContext.paperclipTaskMarkdownAssignmentUnchanged;
     }
   }
   if (issueRef) {

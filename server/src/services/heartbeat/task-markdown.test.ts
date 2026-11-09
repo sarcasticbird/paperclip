@@ -12,6 +12,21 @@ describe("heartbeat task markdown rendering", () => {
     documentId: "plan-1", revisionId: "revision-1", revisionNumber: 3, body,
   });
 
+  it("renders a plan reference without its body only for an explicitly unchanged projection", () => {
+    const body = "Large plan body with exact acceptance criteria.".repeat(600);
+    const input = { issue: { ...issue, description: "Current task description." }, taskPlan: taskPlan(body) };
+    const full = buildPaperclipTaskMarkdown(input)!;
+    const unchanged = buildPaperclipTaskMarkdown({ ...input, includeDescription: false, includeWakeComments: false, includePlanBody: false })!;
+    expect(full).toContain(body);
+    expect(unchanged).not.toContain(body);
+    expect(unchanged).not.toContain(input.issue.description);
+    expect(unchanged).toContain("Task plan document plan-1, revision 3 (revision-1):");
+    expect(unchanged).toContain("read this revision on demand");
+    expect(unchanged).toContain("Follow the current work mode and any required approvals.");
+    expect(unchanged).toContain("user-authored");
+    expect(unchanged.length).toBeLessThan(3000);
+  });
+
   it("renders a description copied into the plan prefix only once without changing saved inputs", () => {
     const description = "## Review evidence\n" + "Exact evidence and required scope.\n".repeat(800);
     const body = `${description.trim()}\n\n## Approved contract\nPreserve independent review and QA.`;

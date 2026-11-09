@@ -44,6 +44,8 @@ import {
   renderTemplate,
   hydrateFreshSessionHandoff,
   selectPaperclipPromptSections,
+  createPaperclipAssignmentReceipt,
+  normalizePaperclipAssignmentReceipt,
   selectInitialCommunicationGuidance,
   isPaperclipRecoveryWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
@@ -576,7 +578,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       run: { id: runId, source: "on_demand" },
       context,
     };
-    const buildPrompt = (resumedSession: boolean) => {
+    const buildPrompt = (resumeSessionId: string | null) => {
+      const resumedSession = Boolean(resumeSessionId);
       const renderedBootstrapPrompt =
         !resumedSession && bootstrapPromptTemplate.trim().length > 0
           ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
@@ -584,6 +587,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const { taskContextNote, wakePrompt } = selectPaperclipPromptSections(context, {
         resumedSession,
         includeCommunicationGuidance: false,
+        assignmentDelivery: {
+          scope: { companyId: agent.companyId, agentId: agent.id, sessionId: resumeSessionId ?? "fresh" },
+          receipt: runtimeSessionParams.paperclipAssignmentReceipt,
+        },
       });
       const shouldUseResumeDeltaPrompt = resumedSession && wakePrompt.length > 0;
       const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
@@ -641,7 +648,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const accountingEnv = executionTargetIsRemote ? preparedRuntimeConfig.env : runtimeEnv;
     const runAttempt = async (resumeSessionId: string | null) => {
       await hydrateFreshSessionHandoff(ctx, { resumedSession: Boolean(resumeSessionId) });
-      const { basePrompt, promptMetrics } = buildPrompt(Boolean(resumeSessionId));
+      const { basePrompt, promptMetrics } = buildPrompt(resumeSessionId);
+      // Capture the projection at submission, not after tools or onMeta may
+      // have changed context. Only a clean native turn can publish this receipt.
+      const assignmentReceipt = createPaperclipAssignmentReceipt(context, {
+        companyId: agent.companyId, agentId: agent.id, sessionId: resumeSessionId ?? "fresh",
+      });
       const prompt = joinPromptSections([
         selectInitialCommunicationGuidance(context, { resumedSession: Boolean(resumeSessionId) }),
         basePrompt,
@@ -704,7 +716,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         parsed.usageComplete = retained.usageComplete;
         parsed.costUsd = retained.costUsd;
       }
-      return { proc, rawStderr: proc.stderr, parsed };
+      return { proc, rawStderr: proc.stderr, parsed, assignmentReceipt, resumeSessionId };
     };
 
     const toResult = (
@@ -712,6 +724,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null };
         rawStderr: string;
         parsed: ReturnType<typeof parseOpenCodeJsonl>;
+        assignmentReceipt?: ReturnType<typeof createPaperclipAssignmentReceipt>;
+        resumeSessionId?: string | null;
       },
       clearSessionOnMissingSession = false,
     ): AdapterExecutionResult => {
@@ -741,6 +755,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const resolvedSessionId =
         attempt.parsed.sessionId ??
         (clearSessionOnMissingSession ? null : runtimeSessionId ?? runtime.sessionId ?? null);
+      const successfulDelivery = attempt.proc.exitCode === 0 && !attempt.proc.signal &&
+        !attempt.proc.errorCode && !attempt.parsed.errorMessage && Boolean(attempt.parsed.sessionId) &&
+        (!attempt.resumeSessionId || attempt.resumeSessionId === attempt.parsed.sessionId);
+      const previousReceipt = normalizePaperclipAssignmentReceipt(runtimeSessionParams.paperclipAssignmentReceipt);
+      const assignmentReceipt = successfulDelivery && attempt.assignmentReceipt
+        ? { ...attempt.assignmentReceipt, sessionId: attempt.parsed.sessionId! }
+        : previousReceipt?.sessionId === resolvedSessionId ? previousReceipt : null;
       const resolvedSessionParams = resolvedSessionId
         ? ({
             sessionId: resolvedSessionId,
@@ -748,6 +769,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             ...(workspaceId ? { workspaceId } : {}),
             ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
             ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
+            ...(assignmentReceipt ? { paperclipAssignmentReceipt: assignmentReceipt } : {}),
             ...(executionTargetIsRemote
               ? {
                   remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),

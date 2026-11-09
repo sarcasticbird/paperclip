@@ -1663,7 +1663,7 @@ export class PaperclipRunnerToolAuthority {
       responsibleUserId: heartbeatRuns.responsibleUserId,
       contextSnapshot: sql<Record<string, unknown> | null>`case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object'
         then ${heartbeatRuns.contextSnapshot} - array['executionContinuation', 'paperclipTaskMarkdown',
-          'paperclipTaskMarkdownCompact', 'paperclipTaskMarkdownAssignment', 'paperclipTaskMarkdownAssignmentCompact',
+          'paperclipTaskMarkdownCompact', 'paperclipTaskMarkdownAssignment', 'paperclipTaskMarkdownAssignmentCompact', 'paperclipTaskMarkdownAssignmentUnchanged',
           'paperclipWorkspace', 'paperclipEnvironment', 'paperclipContinuationSummary', 'paperclipWakeComment']
           ${options.includeChatWake ? sql`` : sql`- 'paperclipWake'`}
         else ${heartbeatRuns.contextSnapshot} end`,

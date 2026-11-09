@@ -73,6 +73,9 @@ export function buildPaperclipTaskMarkdown(input: {
   // Current wake events are rendered by the structured wake prompt on
   // adapter lanes. Keep the legacy default for standalone callers.
   includeWakeComments?: boolean;
+  // Only selected after the adapter proves this exact assignment was delivered
+  // successfully to the same native session. Keep plan identity and policy live.
+  includePlanBody?: boolean;
 }) {
   const quoteTaskScalar = (value: string) => JSON.stringify(value);
   const fenceTaskText = (value: string) => {
@@ -315,7 +318,9 @@ export function buildPaperclipTaskMarkdown(input: {
         "",
         `Task plan document ${input.taskPlan.documentId}, revision ${input.taskPlan.revisionNumber} (${input.taskPlan.revisionId}):`,
         "Use this plan as assignment context, including its outcome and acceptance criteria. Follow the current work mode and any required approvals.",
-        fenceTaskText(planBody),
+        input.includePlanBody === false
+          ? "This exact assignment was already delivered to this session. The plan body is unchanged; read this revision on demand if needed."
+          : fenceTaskText(planBody),
       );
     }
   }

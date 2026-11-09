@@ -143,6 +143,7 @@ describe("withQueuedCommentIdsInRunContext", () => {
       paperclipTaskMarkdownCompact: "historical compact",
       paperclipTaskMarkdownAssignment: "assignment",
       paperclipTaskMarkdownAssignmentCompact: "assignment compact",
+      paperclipTaskMarkdownAssignmentUnchanged: "unchanged assignment",
       paperclipTurnContext: { version: 1, events: { owner: "wake_prompt" } },
     }, ["comment-2"], ["source-wake"]);
 
@@ -160,6 +161,7 @@ describe("withQueuedCommentIdsInRunContext", () => {
     expect(result).not.toHaveProperty("paperclipTaskMarkdownCompact");
     expect(result).not.toHaveProperty("paperclipTaskMarkdownAssignment");
     expect(result).not.toHaveProperty("paperclipTaskMarkdownAssignmentCompact");
+    expect(result).not.toHaveProperty("paperclipTaskMarkdownAssignmentUnchanged");
     expect(result).not.toHaveProperty("paperclipTurnContext");
     expect(withQueuedCommentIdsInRunContext(result, ["comment-3"]).queuedCommentSourceWakeIds).toEqual(["source-wake"]);
   });

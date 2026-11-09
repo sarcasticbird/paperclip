@@ -332,7 +332,7 @@ describe("PaperclipRunnerToolAuthority", () => {
     const [original] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     const payload = "retained-launch-rendering🙂".repeat(8192);
     const context = { ...original.contextSnapshot, executionContinuation: { savedInput: payload }, paperclipTaskMarkdown: payload,
-      paperclipTaskMarkdownCompact: payload, paperclipTaskMarkdownAssignment: payload, paperclipTaskMarkdownAssignmentCompact: payload,
+      paperclipTaskMarkdownCompact: payload, paperclipTaskMarkdownAssignment: payload, paperclipTaskMarkdownAssignmentCompact: payload, paperclipTaskMarkdownAssignmentUnchanged: payload,
       paperclipWorkspace: { savedInput: payload }, paperclipEnvironment: { savedInput: payload },
       paperclipContinuationSummary: payload, paperclipWakeComment: payload, paperclipWake: { retainedPayload: payload } };
     await db.update(heartbeatRuns).set({ contextSnapshot: context }).where(eq(heartbeatRuns.id, runId));

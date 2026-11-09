@@ -151,7 +151,8 @@ describe("durable native provider capacity retry", () => {
     await db.insert(issueComments).values({ id: commentId, companyId, issueId, authorUserId: "capacity-owner", authorType: "user", body: "Continue the investigation." });
     const consumedContext = { issueId, wakeCommentId: commentId, wakeCommentIds: [commentId],
       explicitUserContinuation: { previousRunId: olderRunId, commentId },
-      previousRunId: olderRunId, resumeIntent: "continue", paperclipTurnContext: "Previously delivered context" };
+      previousRunId: olderRunId, resumeIntent: "continue", paperclipTurnContext: "Previously delivered context",
+      paperclipTaskMarkdownAssignmentUnchanged: "Previously rendered unchanged context" };
     await db.insert(heartbeatRuns).values([
       { id: olderRunId, companyId, agentId, status: "failed", contextSnapshot: { issueId } },
       { id: runId, companyId, agentId, responsibleUserId: "capacity-owner", contextSnapshot: consumedContext },
@@ -162,6 +163,7 @@ describe("durable native provider capacity retry", () => {
     expect(retry.contextSnapshot).not.toHaveProperty("wakeCommentId");
     expect(retry.contextSnapshot).not.toHaveProperty("resumeIntent");
     expect(retry.contextSnapshot).not.toHaveProperty("paperclipTurnContext");
+    expect(retry.contextSnapshot).not.toHaveProperty("paperclipTaskMarkdownAssignmentUnchanged");
     const continuation = await buildExecutionContinuation({ db, companyId, issueId, agentId,
       runId: retry.id, context: retry.contextSnapshot!, summary: null, exposeLowTrustRaw: false });
     expect(continuation).toMatchObject({ trigger: { sourceRunId: runId }, objective: "Continue the investigation.",

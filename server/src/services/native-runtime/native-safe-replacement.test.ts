@@ -118,6 +118,7 @@ const support = externalDatabaseUrl
           paperclipTaskMarkdownCompact: "stale historical compact task",
           paperclipTaskMarkdownAssignment: "stale assignment task",
           paperclipTaskMarkdownAssignmentCompact: "stale assignment compact task",
+          paperclipTaskMarkdownAssignmentUnchanged: "stale unchanged projection",
           paperclipTurnContext: {
             version: 1,
             assignment: { owner: "task_markdown" },
@@ -202,6 +203,7 @@ const support = externalDatabaseUrl
               "paperclipTaskMarkdownCompact",
               "paperclipTaskMarkdownAssignment",
               "paperclipTaskMarkdownAssignmentCompact",
+              "paperclipTaskMarkdownAssignmentUnchanged",
               "paperclipTurnContext",
             ]) {
               expect(successors[0]!.contextSnapshot).not.toHaveProperty(key);

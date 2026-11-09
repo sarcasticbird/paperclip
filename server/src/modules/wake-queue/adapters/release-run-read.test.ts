@@ -87,7 +87,7 @@ describe.skipIf(!support.supported)("wake release run reads", () => {
       executionContinuation: { instruction: bulk, state: "saved" },
       paperclipWake: { savedTask: bulk }, paperclipWakeComment: bulk, paperclipTaskMarkdown: bulk,
       paperclipTaskMarkdownCompact: bulk, paperclipTaskMarkdownAssignment: bulk,
-      paperclipTaskMarkdownAssignmentCompact: bulk, paperclipWorkspace: { files: bulk },
+      paperclipTaskMarkdownAssignmentCompact: bulk, paperclipTaskMarkdownAssignmentUnchanged: bulk, paperclipWorkspace: { files: bulk },
       paperclipEnvironment: { input: bulk }, paperclipContinuationSummary: bulk,
     };
     const evidence = { nativeCancellation: { schema: "paperclip.native-cancellation.v1", dispatched: true },

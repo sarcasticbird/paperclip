@@ -467,6 +467,10 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
             context.paperclipTaskMarkdownAssignmentCompact,
           );
       }
+      if (typeof context.paperclipTaskMarkdownAssignmentUnchanged === "string") {
+        context.paperclipTaskMarkdownAssignmentUnchanged =
+          appendConcurrentWorkspaceNote(context.paperclipTaskMarkdownAssignmentUnchanged);
+      }
       logger.info(
         {
           event: "shared_workspace_concurrent_dispatch",

@@ -106,7 +106,7 @@ describePostgres("heartbeat task context delivered to an adapter", () => {
     expect(context.paperclipTaskMarkdownCompact).toContain("Wake comment canary");
     expect(context.paperclipTaskMarkdownAssignmentCompact).not.toContain("Assignment description canary");
     expect(context.paperclipTaskMarkdownAssignmentCompact).not.toContain("Wake comment canary");
-    for (const key of ["paperclipIssue", "paperclipWakeComment", "paperclipTaskMarkdown", "paperclipTaskMarkdownAssignment", "paperclipTaskMarkdownCompact", "paperclipTaskMarkdownAssignmentCompact"]) {
+    for (const key of ["paperclipIssue", "paperclipWakeComment", "paperclipTaskMarkdown", "paperclipTaskMarkdownAssignment", "paperclipTaskMarkdownCompact", "paperclipTaskMarkdownAssignmentCompact", "paperclipTaskMarkdownAssignmentUnchanged"]) {
       expect(JSON.stringify(context[key])).not.toContain(secret);
     }
     expect(context.paperclipTaskCommunicationGuidance).toBe(FAST_RESPONSE_AGENT_GUIDANCE);
@@ -142,6 +142,22 @@ describePostgres("heartbeat task context delivered to an adapter", () => {
       inspectPreparation.delete(f.agentId);
       select.mockRestore();
     }
+  });
+
+  it("rebuilds the unchanged-assignment projection from the canonical plan rather than caller text", async () => {
+    const f = await seed();
+    const body = "gh-sweep read-only qualification; no product writes.\n".repeat(600);
+    const saved = await documentService(db).upsertIssueDocument({
+      issueId: f.issueId, key: "plan", format: "markdown", body,
+    });
+    const { context } = await execute(f, { paperclipTaskMarkdownAssignmentUnchanged: "FORGED projection" });
+    expect(context.paperclipTaskMarkdownAssignment).toContain(body.trim());
+    expect(context.paperclipTaskMarkdownAssignmentCompact).toContain(body.trim());
+    expect(context.paperclipTaskMarkdownAssignmentUnchanged).not.toContain(body.trim());
+    expect(context.paperclipTaskMarkdownAssignmentUnchanged).not.toContain("FORGED");
+    expect(context.paperclipTaskMarkdownAssignmentUnchanged).toContain(saved.document.latestRevisionId);
+    expect(context.paperclipTaskMarkdownAssignmentUnchanged).toContain("read this revision on demand");
+    expect((await documentService(db).getIssueDocumentByKey(f.issueId, "plan"))?.body).toBe(body);
   });
 
   it("cancels deleted-only queued comments before adapter dispatch", async () => {

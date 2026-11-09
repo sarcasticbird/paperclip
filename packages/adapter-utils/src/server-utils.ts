@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
+import { paperclipAssignmentReceiptMatches } from "./prompt-delivery.js";
 import {
   buildLocalProcessSandboxSpawnTarget,
   type LocalProcessSandboxOptions,
@@ -2189,9 +2190,16 @@ export function selectInitialCommunicationGuidance(
 // full brief; other resume deltas get the compact variant (description
 // stripped) because the session already received the brief when it picked the
 // issue up. Falls back to the full variant when no compact one was provided.
+export interface PaperclipAssignmentDelivery {
+  scope: import("./prompt-delivery.js").PaperclipAssignmentScope;
+  receipt: unknown;
+}
+
+export { createPaperclipAssignmentReceipt, normalizePaperclipAssignmentReceipt } from "./prompt-delivery.js";
+
 export function selectPaperclipTaskMarkdown(
   context: Record<string, unknown> | null | undefined,
-  options: { resumedSession?: boolean; includeCommunicationGuidance?: boolean } = {},
+  options: { resumedSession?: boolean; includeCommunicationGuidance?: boolean; assignmentDelivery?: PaperclipAssignmentDelivery } = {},
 ): string {
   const full = asString(
     context?.paperclipTaskMarkdownAssignment ?? context?.paperclipTaskMarkdown,
@@ -2210,6 +2218,11 @@ export function selectPaperclipTaskMarkdown(
     isPaperclipRecoveryWakePayload(context?.paperclipWake)
   ) {
     return full;
+  }
+  if (options.assignmentDelivery) {
+    return paperclipAssignmentReceiptMatches(context, options.assignmentDelivery.scope, options.assignmentDelivery.receipt)
+      ? asString(context?.paperclipTaskMarkdownAssignmentUnchanged, "").trim() || full
+      : full;
   }
   const compact = asString(
     context?.paperclipTaskMarkdownAssignmentCompact ?? context?.paperclipTaskMarkdownCompact,
@@ -2232,9 +2245,14 @@ export function selectPaperclipPromptSections(
     /** @deprecated Generic execution instructions are no longer injected. */
     includeExecutionContract?: boolean;
     nativeWakeReaderAvailable?: boolean;
+    assignmentDelivery?: PaperclipAssignmentDelivery;
   } = {},
 ): { taskContextNote: string; wakePrompt: string } {
   const taskContextNote = selectPaperclipTaskMarkdown(context, options);
+  const wake = normalizePaperclipWakePayload(context?.paperclipWake);
+  const assignmentBriefAlreadyDelivered = Boolean(options.assignmentDelivery && options.resumedSession && wake &&
+    !isAssignmentShapedPaperclipWakeReason(wake.reason) && !isPaperclipRecoveryWakePayload(context?.paperclipWake) &&
+    paperclipAssignmentReceiptMatches(context, options.assignmentDelivery.scope, options.assignmentDelivery.receipt));
   return {
     taskContextNote,
     wakePrompt: renderPaperclipWakePrompt(context?.paperclipWake, {
@@ -2243,6 +2261,7 @@ export function selectPaperclipPromptSections(
       nativeWakeReaderAvailable: options.nativeWakeReaderAvailable,
       conversationMode: context?.conversationMode === true,
       suppressIssueDescription: taskContextNote.length > 0,
+      assignmentBriefAlreadyDelivered,
     }),
   };
 }
@@ -2276,6 +2295,9 @@ function renderPaperclipWakePromptBody(
     // (the authoritative, uncapped brief) so the description is not delivered
     // twice in one prompt.
     suppressIssueDescription?: boolean;
+    // Set only from a session-bound successful-delivery receipt, never from the
+    // mere existence of a prepared compact assignment in a context snapshot.
+    assignmentBriefAlreadyDelivered?: boolean;
   } = {},
 ): string {
   const normalized = normalizePaperclipWakePayload(value);
@@ -2311,7 +2333,7 @@ function renderPaperclipWakePromptBody(
   const continuationObjectiveOwnedByAssignment = (continuation: ExecutionContinuationEnvelope) =>
     options.suppressIssueDescription === true &&
     continuation.issueId === normalized.issue?.id &&
-    !resumeOmitsIssueDescription &&
+    (!resumeOmitsIssueDescription || options.assignmentBriefAlreadyDelivered === true) &&
     continuation.objectiveSource !== undefined &&
     ((continuation.objectiveSource.kind === "description" &&
       continuation.objectiveSource.id === normalized.issue.id &&

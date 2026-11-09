@@ -114,6 +114,39 @@ until an explicit close-readiness or lifecycle inspection computes it. Workspace
 detail reads also return unknown delivery state without running Git or contacting
 a storage provider. Use close-readiness for current Git safety checks.
 
+### OpenCode assignment delivery and bounded resumes
+
+Task Markdown owns the brief; the structured wake owns current events. The server
+also prepares `paperclipTaskMarkdownAssignmentUnchanged`, retaining current policy
+and plan document/revision references but not the description or plan body. This
+projection is never sufficient evidence that a provider received the brief.
+
+OpenCode opts into the shared prompt selector's session-bound delivery contract.
+A successful native turn with a returned session ID can save a version-1
+`paperclipAssignmentReceipt` in its existing adapter session parameters. It binds
+company, agent, issue, native session and a digest of both assignment projections,
+not prompt bodies or credentials. The codec preserves only validated receipt fields.
+Only a compatible ordinary resume with an exact match selects the unchanged
+projection. A changed description, plan revision, approval directive or projection
+redelivers the full current assignment. Current wake events still reach every turn.
+
+Old sessions without receipts keep their native session and receive the full
+current assignment on the next turn; there is no schema migration, reset or history
+deletion. Unknown/malformed optional receipt versions are ignored for optimization,
+not interpreted as new execution authority. Fresh, assignment-shaped and recovery
+attempts receive the full brief. Unknown-session fallback reconstructs a fresh
+prompt. Failed, timed-out, transport-failed or substituted-session results cannot
+advance delivery receipts; a prepared context or invocation log is not delivery.
+Other adapters retain their existing selection policy until explicitly qualified.
+
+Keep this projection under the same secret-redaction, concurrent-workspace warning,
+queued-comment invalidation and native launch-payload omission boundaries as the
+other generated Markdown fields. The extra clearing/SQL projection changes carry
+only this new field; they change no native recovery or execution policy. Stored
+task documents and previous run records stay complete and unchanged. This receipt
+does not deduplicate external writes or solve provider token limits: pinned harness
+compaction, durable file memory and wake admission remain their existing owners.
+
 ## Deployment Modes
 
 For mode definitions and intended CLI behavior, see `doc/DEPLOYMENT-MODES.md`.

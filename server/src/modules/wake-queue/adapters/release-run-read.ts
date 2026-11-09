@@ -11,7 +11,7 @@ export async function readReleaseRun(db: Db, scope: { companyId: string; runId: 
       and jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object'
       then ${heartbeatRuns.contextSnapshot} - array['executionContinuation', 'paperclipWake', 'paperclipWakeComment',
         'paperclipTaskMarkdown', 'paperclipTaskMarkdownCompact', 'paperclipTaskMarkdownAssignment',
-        'paperclipTaskMarkdownAssignmentCompact', 'paperclipWorkspace', 'paperclipEnvironment',
+        'paperclipTaskMarkdownAssignmentCompact', 'paperclipTaskMarkdownAssignmentUnchanged', 'paperclipWorkspace', 'paperclipEnvironment',
         'paperclipContinuationSummary']
       else ${heartbeatRuns.contextSnapshot} end`,
     runnerProfileJson: sql<Run["runnerProfileJson"]>`case when ${heartbeatRuns.runtimeMode} = 'native'
