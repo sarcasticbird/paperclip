@@ -297,15 +297,25 @@ export function buildPaperclipTaskMarkdown(input: {
     }
     const description =
       input.includeDescription === false || issue.conversationAgentId ? "" : issue.description?.trim();
+    const planBody = !issue.conversationAgentId ? input.taskPlan?.body.trim() : "";
+    // Handoffs may seed the plan with the exact description followed by the
+    // approved contract. Keep the plan verbatim, including its revision, without
+    // injecting that same brief twice. Do not collapse partial or quoted matches.
+    const descriptionInPlan = Boolean(description && planBody &&
+      (planBody === description || planBody.startsWith(`${description}\n`)));
     if (description) {
-      lines.push("", "Issue description:", fenceTaskText(description));
+      if (descriptionInPlan) {
+        lines.push("", "Issue description: included verbatim at the start of the task plan below; not repeated here.");
+      } else {
+        lines.push("", "Issue description:", fenceTaskText(description));
+      }
     }
-    if (!issue.conversationAgentId && input.taskPlan?.body.trim()) {
+    if (input.taskPlan && planBody) {
       lines.push(
         "",
         `Task plan document ${input.taskPlan.documentId}, revision ${input.taskPlan.revisionNumber} (${input.taskPlan.revisionId}):`,
         "Use this plan as assignment context, including its outcome and acceptance criteria. Follow the current work mode and any required approvals.",
-        fenceTaskText(input.taskPlan.body.trim()),
+        fenceTaskText(planBody),
       );
     }
   }

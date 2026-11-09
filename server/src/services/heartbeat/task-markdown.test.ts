@@ -8,6 +8,55 @@ const issue = {
 };
 
 describe("heartbeat task markdown rendering", () => {
+  const taskPlan = (body: string) => ({
+    documentId: "plan-1", revisionId: "revision-1", revisionNumber: 3, body,
+  });
+
+  it("renders a description copied into the plan prefix only once without changing saved inputs", () => {
+    const description = "## Review evidence\n" + "Exact evidence and required scope.\n".repeat(800);
+    const body = `${description.trim()}\n\n## Approved contract\nPreserve independent review and QA.`;
+    const input = { issue: { ...issue, description }, taskPlan: taskPlan(body) };
+    const before = structuredClone(input);
+    const markdown = buildPaperclipTaskMarkdown(input)!;
+
+    expect(markdown.split(description.trim())).toHaveLength(2);
+    expect(markdown).toContain("Issue description: included verbatim at the start of the task plan below; not repeated here.");
+    expect(markdown).toContain("Task plan document plan-1, revision 3 (revision-1):");
+    expect(markdown).toContain(body);
+    expect(markdown).toContain("Follow the current work mode and any required approvals.");
+    expect(input).toEqual(before);
+  });
+
+  it("deduplicates an identical description and plan", () => {
+    const description = "Perform the requested review.";
+    const markdown = buildPaperclipTaskMarkdown({ issue: { ...issue, description }, taskPlan: taskPlan(description) })!;
+    expect(markdown.split(description)).toHaveLength(2);
+  });
+
+  it.each([
+    "Independent outcome and acceptance criteria.",
+    "Review evidence changed; do not use the old scope.",
+    "Review evidence extended inline.",
+    "Historical quotation:\nReview evidence\nCurrent instructions differ.",
+  ])("keeps descriptions distinct from nonmatching or quoted plans: %s", (body) => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: { ...issue, description: "Review evidence" }, taskPlan: taskPlan(body),
+    });
+    expect(markdown).toContain("Issue description:\n```text\nReview evidence\n```");
+    expect(markdown).toContain(body);
+  });
+
+  it("keeps the full plan in compact assignments and does not reintroduce its copied description", () => {
+    const description = "Required task scope.";
+    const body = `${description}\n\nCurrent acceptance criteria.`;
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: { ...issue, description }, taskPlan: taskPlan(body), includeDescription: false,
+    })!;
+    expect(markdown.split(description)).toHaveLength(2);
+    expect(markdown).toContain(body);
+    expect(markdown).not.toContain("Issue description:");
+  });
+
   it.each([true, false])("keeps native task clarification in the current task on full and resumed assignments (description=%s)", (includeDescription) => {
     const markdown = buildPaperclipTaskMarkdown({
       issue: { ...issue, description: "Write a blog post about our launch." },
