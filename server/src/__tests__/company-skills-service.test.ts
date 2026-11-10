@@ -830,10 +830,25 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     });
 
     const initialList = await svc.list(companyId);
-    await svc.list(companyId);
     const paperclipSkill = initialList.find((skill) => skill.key === "paperclipai/paperclip/paperclip");
     expect(paperclipSkill).toBeDefined();
     if (!paperclipSkill) throw new Error("Expected bundled Paperclip skill");
+
+    // Model an existing company receiving a newly shipped registry entry.
+    // Its operator-selected current version and an independent agent pin must
+    // survive registration, not merely a subsequent materialization read.
+    const beforeRegistration = await svc.listVersions(companyId, paperclipSkill.id);
+    const previousChampion = beforeRegistration.find(version => version.releaseId === "v7-roster")!;
+    const firstBounded = beforeRegistration.find(version => version.releaseId === "v8-bounded-context")!;
+    await db.update(companySkills).set({ currentVersionId: previousChampion.id })
+      .where(eq(companySkills.id, paperclipSkill.id));
+    await db.delete(companySkillVersions).where(eq(companySkillVersions.id, firstBounded.id));
+    const pinnedAgentId = randomUUID();
+    const pinnedConfig = { paperclipSkillSync: { desiredSkills: [{ key: paperclipSkill.key, versionId: previousChampion.id }] } };
+    await db.insert(agents).values({ id: pinnedAgentId, companyId, name: "Pinned operator", role: "engineer",
+      adapterType: "opencode_local", adapterConfig: pinnedConfig });
+    await svc.list(companyId);
+    await svc.list(companyId);
 
     const versions = await svc.listVersions(companyId, paperclipSkill.id);
     expect(versions.flatMap(version => version.releaseId ? [version.releaseId] : []).sort()).toEqual(["v0", "v7-roster", "v8-bounded-context"]);
@@ -844,6 +859,10 @@ describeEmbeddedPostgres("companySkillService.list", () => {
       .where(eq(companySkills.id, paperclipSkill.id))
       .then((rows) => rows[0]);
     expect(versions.some(version => version.id === storedSkill?.currentVersionId)).toBe(true);
+    expect(storedSkill?.currentVersionId).toBe(previousChampion.id);
+    const [pinnedAgent] = await db.select({ config: agents.adapterConfig }).from(agents)
+      .where(eq(agents.id, pinnedAgentId));
+    expect(pinnedAgent?.config).toEqual(pinnedConfig);
 
     const bounded = versions.find(version => version.releaseId === "v8-bounded-context")!;
     expect(bounded.id).not.toBe(storedSkill?.currentVersionId);
@@ -856,6 +875,22 @@ describeEmbeddedPostgres("companySkillService.list", () => {
       .toBe(28653);
     expect(await fs.readFile(path.join(boundedSource.source, "WORKFLOWS.md"), "utf8"))
       .toContain("# Paperclip Workflow Reference");
+    const boundedVersion = (await svc.getVersion(companyId, paperclipSkill.id, bounded.id))!;
+    const boundedActual: Record<string, string> = {};
+    async function walkBounded(root: string, current = root): Promise<void> {
+      for (const entry of await fs.readdir(current, { withFileTypes: true })) {
+        const absolute = path.join(current, entry.name);
+        if (entry.isDirectory()) { await walkBounded(root, absolute); continue; }
+        expect(entry.isFile()).toBe(true);
+        const relative = path.relative(root, absolute).split(path.sep).join("/");
+        boundedActual[relative] = createHash("sha256").update(await fs.readFile(absolute)).digest("hex");
+      }
+    }
+    await walkBounded(boundedSource.source);
+    expect(boundedActual).toEqual(Object.fromEntries(boundedVersion.fileInventory.map(entry => [
+      entry.path, createHash("sha256").update(entry.content).digest("hex"),
+    ])));
+    expect(boundedActual["SKILL.md"]).toBe("5ba736897d59303f9b7e0fb7fa3b303285a9aa8f475cc6193e1866d9b8fb46e6");
     const [afterSelection] = await db.select({ currentVersionId: companySkills.currentVersionId })
       .from(companySkills).where(eq(companySkills.id, paperclipSkill.id));
     expect(afterSelection?.currentVersionId).toBe(storedSkill?.currentVersionId);
