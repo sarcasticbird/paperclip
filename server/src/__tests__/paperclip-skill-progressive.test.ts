@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 
 const load = (name: string) => readFile(new URL(`../../../skills/paperclip/${name}`, import.meta.url), "utf8");
@@ -11,6 +11,31 @@ function section(body: string, heading: string) {
 }
 
 describe("bounded Paperclip skill entrypoint", () => {
+  it("ships a complete selectable immutable release, not just changed source files", async () => {
+    const source = new URL("../../../skills/paperclip/", import.meta.url);
+    const releases = new URL("../../../skills-releases/paperclip/", import.meta.url);
+    const registry = JSON.parse(await readFile(new URL("releases.json", releases), "utf8"));
+    const release = registry.find((entry: { id: string }) => entry.id === "v8-bounded-context");
+    expect(release.dir).toBe("v8-bounded-context");
+    const snapshot = new URL(`${release.dir}/`, releases);
+    const files = async (root: URL, prefix = ""): Promise<string[]> => {
+      const result: string[] = [];
+      for (const entry of await readdir(new URL(prefix, root), { withFileTypes: true })) {
+        const name = `${prefix}${entry.name}`;
+        if (entry.isDirectory()) result.push(...await files(root, `${name}/`));
+        else { expect(entry.isFile()).toBe(true); result.push(name); }
+      }
+      return result.sort();
+    };
+    const names = await files(source);
+    expect(await files(snapshot)).toEqual(names);
+    for (const name of names) {
+      expect(await readFile(new URL(name, snapshot))).toEqual(await readFile(new URL(name, source)));
+    }
+    expect(names).toContain("WORKFLOWS.md");
+    expect(names).toContain("scripts/paperclip-issue-update.sh");
+  });
+
   it("preserves the complete previous procedures with sibling reference paths intact", async () => {
     const original = (await load("WORKFLOWS.md")).replace("# Paperclip Workflow Reference", "# Paperclip Skill");
     // Pin the pre-split contract: shortening the entrypoint must not delete a

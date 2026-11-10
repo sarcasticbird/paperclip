@@ -12,5 +12,12 @@
     "releasedAt": "2026-07-21",
     "notes": "Adopted by PAP-14624 G3 confirmation card 9c304fc2. This frozen historical release predates three later master edits to SKILL.md, references/api-reference.md, and references/company-skills.md; the live default keeps the newer guidance.",
     "dir": "v7-roster"
+  },
+  {
+    "id": "v8-bounded-context",
+    "releaseName": "V8 — Bounded context",
+    "releasedAt": "2026-11-10",
+    "notes": "Reviewed compact operating entrypoint with complete sibling workflow reference. Select explicitly for qualification; registering this immutable release does not change the company current version or existing agent pins. Snapshot matches skills/paperclip at 4ac06f491d4707374f71e73df856cd105014b729.",
+    "dir": "v8-bounded-context"
   }
 ]

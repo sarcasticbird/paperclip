@@ -836,14 +836,29 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     if (!paperclipSkill) throw new Error("Expected bundled Paperclip skill");
 
     const versions = await svc.listVersions(companyId, paperclipSkill.id);
-    expect(versions.flatMap(version => version.releaseId ? [version.releaseId] : []).sort()).toEqual(["v0", "v7-roster"]);
-    expect(versions).toHaveLength(3);
+    expect(versions.flatMap(version => version.releaseId ? [version.releaseId] : []).sort()).toEqual(["v0", "v7-roster", "v8-bounded-context"]);
+    expect(versions).toHaveLength(4);
     const storedSkill = await db
       .select({ currentVersionId: companySkills.currentVersionId })
       .from(companySkills)
       .where(eq(companySkills.id, paperclipSkill.id))
       .then((rows) => rows[0]);
     expect(versions.some(version => version.id === storedSkill?.currentVersionId)).toBe(true);
+
+    const bounded = versions.find(version => version.releaseId === "v8-bounded-context")!;
+    expect(bounded.id).not.toBe(storedSkill?.currentVersionId);
+    const boundedEntries = await svc.listRuntimeSkillEntries(companyId, {
+      versionSelections: new Map([[paperclipSkill.key, bounded.id]]),
+    });
+    const boundedSource = boundedEntries.find(entry => entry.key === paperclipSkill.key)!;
+    expect(boundedSource).toMatchObject({ versionId: bounded.id, sourceStatus: "available" });
+    expect(Buffer.byteLength(await fs.readFile(path.join(boundedSource.source, "SKILL.md"), "utf8")))
+      .toBe(28653);
+    expect(await fs.readFile(path.join(boundedSource.source, "WORKFLOWS.md"), "utf8"))
+      .toContain("# Paperclip Workflow Reference");
+    const [afterSelection] = await db.select({ currentVersionId: companySkills.currentVersionId })
+      .from(companySkills).where(eq(companySkills.id, paperclipSkill.id));
+    expect(afterSelection?.currentVersionId).toBe(storedSkill?.currentVersionId);
 
     const champion = versions.find((version) => version.releaseId === "v7-roster");
     expect(champion).toMatchObject({
