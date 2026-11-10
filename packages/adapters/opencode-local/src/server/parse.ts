@@ -38,6 +38,7 @@ export function createOpenCodeJsonlParser() {
   let missingCost = false;
   let usageReported = false;
   let missingUsage = false;
+  let executionStarted = false;
 
   return (stdout: string) => {
     for (const rawLine of stdout.split(/\r?\n/)) {
@@ -51,6 +52,7 @@ export function createOpenCodeJsonlParser() {
       if (currentSessionId) sessionId = currentSessionId;
 
       const type = asString(event.type, "");
+      if (type && type !== "error") executionStarted = true;
 
       if (type === "text") {
         const part = parseObject(event.part);
@@ -102,6 +104,7 @@ export function createOpenCodeJsonlParser() {
       costUsd: missingCost ? null : costUsd,
       errorMessage: errors.length > 0 ? errors.join("\n") : null,
       toolErrors,
+      executionStarted,
     };
   };
 }
@@ -116,4 +119,15 @@ export function isOpenCodeUnknownSessionError(stdout: string, stderr: string): b
   return /unknown\s+session|session\b.*\bnot\s+found|resource\s+not\s+found:.*[\\/]session[\\/].*\.json|notfounderror|no session/i.test(
     haystack,
   );
+}
+
+/** Automatic resend requires an isolated structured session rejection, not a
+ * phrase in diagnostics, tool output, or a mixed/possibly executed transcript. */
+export function isOpenCodePreDispatchSessionRejection(stdout: string): boolean {
+  const lines = stdout.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  if (lines.length !== 1) return false;
+  const event = parseJson(lines[0]!);
+  if (event?.type !== "error") return false;
+  const message = errorText(event.error ?? event.message).trim();
+  return /^(?:unknown\s+session(?:\s+id)?|session\s+not\s+found)(?:\s*:[^\n]*|\s+[a-zA-Z0-9_-]+)?\s*$/i.test(message);
 }

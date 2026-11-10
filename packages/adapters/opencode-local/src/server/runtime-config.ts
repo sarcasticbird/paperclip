@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { asBoolean } from "@paperclipai/adapter-utils/server-utils";
 import { installSandboxToolMemoryPreference } from "./sandbox-tool-memory.js";
+import { installCompactionAccounting } from "./compaction-accounting.js";
 
 type PreparedOpenCodeRuntimeConfig = {
   env: Record<string, string>;
@@ -237,6 +238,10 @@ export async function prepareOpenCodeRuntimeConfig(input: {
     } catch {
       notes.push("Could not prepare sandbox Bash tool memory preference; continuing with the existing shell behavior.");
     }
+  }
+  if (asBoolean(input.config.captureOpenCodeV2CompactionUsage, false)) {
+    await installCompactionAccounting(runtimeConfigDir);
+    notes.push("Prepared pinned OpenCode V2 compaction accounting capture.");
   }
 
   return {

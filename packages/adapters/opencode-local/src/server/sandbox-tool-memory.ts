@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-async function preparePluginDirectory(configDir: string, pluginDir: string): Promise<void> {
+export async function preparePluginDirectory(configDir: string, pluginDir: string): Promise<void> {
   const stat = await fs.lstat(pluginDir).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return null;
     throw error;

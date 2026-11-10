@@ -2,6 +2,7 @@ import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provid
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import { withWorkspaceRestore } from "@paperclipai/adapter-utils/workspace-restore-result";
 import fs from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,6 +31,7 @@ import {
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
+  asBoolean,
   asNumber,
   asStringArray,
   parseObject,
@@ -56,7 +58,7 @@ import {
   readPaperclipIssueWorkModeFromContext,
   resolveLegacyPaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
-import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl, createOpenCodeJsonlParser } from "./parse.js";
+import { parseOpenCodeJsonl, createOpenCodeJsonlParser, isOpenCodePreDispatchSessionRejection } from "./parse.js";
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
   isTruthyEnvFlag,
@@ -68,6 +70,7 @@ import { apiKeyBillingType } from "@paperclipai/adapter-utils/api-billing-type";
 import { prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes } from "./runtime-config.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { resolveOpenCodeSkillsHome } from "./skills.js";
+import { compactionAccountingRecords, READ_COMPACTION_CAPTURE } from "./compaction-accounting.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -641,12 +644,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         args.push("--dir", effectiveExecutionCwd);
       }
       if (extraArgs.length > 0) args.push(...extraArgs);
+      if (asBoolean(config.captureOpenCodeV2CompactionUsage, false)) {
+        // Capture belongs to this CLI's private server, never an existing server
+        // whose plugin environment and lifecycle this attempt does not own.
+        if (extraOptionArgs.some(arg => arg === "--server" || arg.startsWith("--server="))) {
+          throw new Error("opencode_compaction_capture_external_server_unsupported");
+        }
+        if (!extraOptionArgs.includes("--standalone")) args.splice(1, 0, "--standalone");
+      }
       return args;
     };
 
     // Remote targets receive only the prepared environment, never host keys.
     const accountingEnv = executionTargetIsRemote ? preparedRuntimeConfig.env : runtimeEnv;
     const runAttempt = async (resumeSessionId: string | null) => {
+      const captureEnabled = asBoolean(config.captureOpenCodeV2CompactionUsage, false);
+      const captureId = randomUUID();
+      const captureRoot = executionTargetIsRemote ? remoteRuntimeRootDir : localRuntimeConfigHome;
+      if (captureEnabled && !captureRoot) throw new Error("opencode_compaction_capture_root_missing");
+      const captureFile = captureRoot ? path.posix.join(captureRoot, `.paperclip-compaction-${captureId}.jsonl`) : "";
+      if (captureEnabled) {
+        preparedRuntimeConfig.env.PAPERCLIP_OPENCODE_COMPACTION_ID = captureId;
+        preparedRuntimeConfig.env.PAPERCLIP_OPENCODE_COMPACTION_FILE = captureFile;
+      }
       await hydrateFreshSessionHandoff(ctx, { resumedSession: Boolean(resumeSessionId) });
       const { basePrompt, promptMetrics } = buildPrompt(resumeSessionId);
       // Capture the projection at submission, not after tools or onMeta may
@@ -683,8 +703,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           costStatus: parsed.usageComplete || parsed.costUsd != null ? undefined : "unpriced",
           usageBasis: "per_run", provider, biller: resolveOpenCodeBiller(accountingEnv, provider), billingType: apiKeyBillingType(provider, accountingEnv), model, complete: false };
       });
+      let processStopped = false;
+      const primaryDigest = createHash("sha256");
+      let primaryBytes = 0;
+      const recordProviderStop = providerStop.beginInvocation();
       const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
-        onProcessStopped: providerStop.beginInvocation(),
+        onProcessStopped: () => { processStopped = true; recordProviderStop(); },
         // Keep a long sandbox run off the synchronous command HTTP request.
         // Probes and preparation keep their existing execution paths.
         ...(runtimeExecutionTarget?.kind === "remote" && runtimeExecutionTarget.transport === "sandbox"
@@ -696,19 +720,56 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         graceSec,
         onSpawn,
         onRuntimeProgress: ctx.onRuntimeProgress,
-        onLog: accountingLog,
+        onLog: async (stream, chunk) => {
+          if (stream === "stdout") { primaryDigest.update(chunk); primaryBytes += Buffer.byteLength(chunk); }
+          await accountingLog(stream, chunk);
+        },
         runLogTail: paperclipBridge?.runLogTail,
         settleRunDisposition: paperclipBridge?.settleRunDisposition,
       });
       // Parse any unterminated final record before deciding whether its usage
       // is complete. A clean exit alone cannot turn absent counters into zero.
       await accountingLog.flush();
+      const primary = parseOpenCodeJsonl(proc.stdout);
+      const streamedDigest = primaryDigest.digest("hex");
+      const primaryOutputComplete = primaryBytes === 0 || (primaryBytes === Buffer.byteLength(proc.stdout)
+        && streamedDigest === createHash("sha256").update(proc.stdout).digest("hex"));
+      // Only a primary, pre-execution session rejection may authorize fallback.
+      // Auxiliary diagnostics and arbitrary assistant/tool text are never retry
+      // evidence, even when they contain a missing-session phrase.
+      const retrySafeMissingSession = processStopped && !proc.timedOut && !proc.signal && !proc.errorCode
+        && primaryOutputComplete && !primary.executionStarted && !consumeAccounting("").usageReported
+        && isOpenCodePreDispatchSessionRejection(proc.stdout);
+      let captureIncomplete = false;
+      if (captureEnabled) {
+        if (!hasAccounting && proc.stdout) {
+          await accountingLog("stdout", proc.stdout);
+          await accountingLog.flush();
+        }
+        let raw = "";
+        try {
+          if (!processStopped || proc.timedOut || proc.signal || proc.errorCode || proc.exitCode === null) {
+            throw new Error("opencode_compaction_capture_stop_unconfirmed");
+          }
+          const receipt = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, "node",
+            ["-e", READ_COMPACTION_CAPTURE, captureFile], { cwd, env: preparedRuntimeConfig.env,
+              timeoutSec: Math.min(timeoutSec > 0 ? timeoutSec : 30, 30), graceSec: 0, onLog: async () => {} });
+          if (receipt.exitCode === 0 && !receipt.signal && !receipt.timedOut && !receipt.errorCode) raw = receipt.stdout;
+        } catch { /* Stop/transport failure preserves primary usage, never proves zero auxiliary cost. */ }
+        const receipt = compactionAccountingRecords(raw, {
+          captureId, sessionId: consumeAccounting("").sessionId, model,
+        });
+        captureIncomplete = !receipt.complete;
+        if (receipt.jsonl) await accountingLog("stdout", receipt.jsonl);
+        await accountingLog.flush();
+      }
       const retainedAccounting = consumeAccounting("");
-      await accountingLog.flush({ complete: proc.exitCode === 0 && !proc.timedOut && !proc.signal
+      await accountingLog.flush({ complete: proc.exitCode === 0 && !proc.timedOut && !proc.signal && !proc.errorCode
+        && (!captureEnabled || (processStopped && !captureIncomplete))
         && (retainedAccounting.usageComplete || retainedAccounting.costUsd != null) });
       // Display output is capped by the process transport. Keep accounting
       // from the full stream, including when no checkpoint callback is installed.
-      const parsed = parseOpenCodeJsonl(proc.stdout);
+      const parsed = primary;
       if (hasAccounting) {
         const retained = consumeAccounting("");
         parsed.usage = retained.usage;
@@ -716,7 +777,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         parsed.usageComplete = retained.usageComplete;
         parsed.costUsd = retained.costUsd;
       }
-      return { proc, rawStderr: proc.stderr, parsed, assignmentReceipt, resumeSessionId };
+      // The accounting projection intentionally drops error contents. Only the
+      // adapter-owned capture result may supply this fixed diagnostic code.
+      if (captureIncomplete) parsed.errorMessage = [parsed.errorMessage,
+        "opencode_compaction_accounting_incomplete"].filter(Boolean).join("\n");
+      return { proc, rawStderr: proc.stderr, parsed, assignmentReceipt, resumeSessionId, retrySafeMissingSession };
     };
 
     const toResult = (
@@ -792,7 +857,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: synthesizedExitCode,
         signal: attempt.proc.signal,
         timedOut: false,
-        usageComplete: attempt.proc.exitCode === 0 && !attempt.proc.signal
+        usageComplete: attempt.proc.exitCode === 0 && !attempt.proc.signal && !attempt.proc.errorCode
           && (attempt.parsed.usageComplete || attempt.parsed.costUsd != null),
         usageBasis: "per_run",
         errorMessage: (synthesizedExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
@@ -822,12 +887,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const executeTurn = async () => {
       const initial = await runAttempt(sessionId);
-      const initialFailed =
-        !initial.proc.timedOut && ((initial.proc.exitCode ?? 0) !== 0 || Boolean(initial.parsed.errorMessage));
       if (
         sessionId &&
-        initialFailed &&
-        isOpenCodeUnknownSessionError(initial.proc.stdout, initial.rawStderr)
+        initial.retrySafeMissingSession
       ) {
         await onLog(
           "stdout",

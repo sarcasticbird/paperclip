@@ -49,6 +49,124 @@ describe("OpenCode local skill injection", () => {
     await fs.rm(configHome, { recursive: true, force: true });
   });
 
+  it.each(["complete", "missing", "ready-only"].flatMap(mode => [false, true].map(streamed => ({ mode, streamed }))))(
+    "merges attempt-scoped V2 compaction receipts and preserves incomplete accounting ($mode, streamed=$streamed)", async ({ mode, streamed }) => {
+    const missing = mode !== "complete";
+    const commandPath = path.join(configHome, "fake-opencode-compaction");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const checkpoints: Array<{ costUsd?: number | null; costStatus?: string; complete?: boolean }> = [];
+    runProcessMock.mockReset().mockImplementation(async (_run, _target, command, _args, options) => {
+      if (command !== "node") {
+        const stdout = JSON.stringify({ type: "step_finish", sessionID: "session-usage",
+          part: { cost: 0.121055, tokens: { input: 43304, output: 860, cache: { read: 42025 } } } }) + "\n";
+        if (streamed) await options.onLog("stdout", stdout);
+        options.onProcessStopped?.();
+        return probeResult({ stdout });
+      }
+      const captureId = options.env!.PAPERCLIP_OPENCODE_COMPACTION_ID;
+      const rows = [{ version: 1, captureId, type: "ready", runtime: "2.2.5" },
+        { version: 1, captureId, type: "started", sessionId: "session-usage" },
+        { version: 1, captureId, type: "completed", sessionId: "session-usage", aggregateId: "session-usage",
+          eventId: "evt-1", sequence: 22, model: { providerID: "openai", id: "gpt-6.1-sol" }, cost: 0.0414047,
+          tokens: { input: 3, output: 925, cache: { read: 24962, write: 11861 } } },
+        { version: 1, captureId, type: "finalized", runtime: "2.2.5", records: 3 }];
+      return probeResult({ stdout: mode === "missing" ? "" : (mode === "ready-only" ? rows.slice(0, 1) : rows)
+        .map(r => JSON.stringify(r) + "\n").join("") });
+    });
+    const result = await execute({ runId: "run-compaction", agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: commandPath, cwd: configHome, model: "openai/gpt-6.1-sol", captureOpenCodeV2CompactionUsage: true,
+        extraArgs: ["--", "--standalone"],
+        env: { OPENCODE_ALLOW_ALL_MODELS: "1" } }, context: {}, onLog: async () => {},
+      onUsage: async checkpoint => { checkpoints.push(checkpoint); } });
+    if (missing) {
+      expect(result.costUsd).toBeNull();
+      expect(result.errorMessage).toContain("opencode_compaction_accounting_incomplete");
+      expect(result.usageComplete).toBe(false);
+      expect(result.costStatus).toBe("unpriced");
+      expect(result.exitCode).toBe(1);
+      expect(checkpoints.at(-1)).toMatchObject({ costUsd: null, costStatus: "unpriced", complete: false });
+    } else {
+      expect(result.costUsd).toBeCloseTo(0.1624597, 9);
+      expect(result.usage).toEqual({ inputTokens: 55168, cachedInputTokens: 66987, outputTokens: 1785 });
+      expect(checkpoints.at(-1)?.costUsd).toBeCloseTo(0.1624597, 9);
+      expect(checkpoints.at(-1)?.complete).toBe(true);
+    }
+    expect(runProcessMock.mock.calls[0]![3]).toContain("--standalone");
+    const args = runProcessMock.mock.calls[0]![3];
+    expect(args.indexOf("--standalone")).toBeLessThan(args.indexOf("--"));
+    expect(runProcessMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects external-server capture before invoking an unowned runtime", async () => {
+    const commandPath = path.join(configHome, "fake-opencode-external");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    runProcessMock.mockReset();
+    await expect(execute({ runId: "run-external", agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: commandPath, cwd: configHome, model: "openai/gpt-6.1-sol", captureOpenCodeV2CompactionUsage: true,
+        extraArgs: ["--server=http://unowned.invalid"], env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+      context: {}, onLog: async () => {} })).rejects.toThrow("opencode_compaction_capture_external_server_unsupported");
+    expect(runProcessMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: "successful output mentions unknown session", stopped: true, primary: {} },
+    { name: "timeout", stopped: true, primary: { timedOut: true } },
+    { name: "signal", stopped: true, primary: { signal: "SIGTERM" } },
+    { name: "unknown stop", stopped: false, primary: { errorCode: "duplex_channel_lost" } },
+    { name: "missing stop receipt", stopped: false, primary: {} },
+  ])("does not replay or read after an unsafe accounting boundary: $name", async ({ stopped, primary }) => {
+    const commandPath = path.join(configHome, "fake-opencode-safe-boundary");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const checkpoints: Array<{ complete?: boolean; costStatus?: string }> = [];
+    runProcessMock.mockReset().mockImplementation(async (_run, _target, command, _args, options) => {
+      if (command === "node") return probeResult({ stdout: "" });
+      const stdout = [
+        { type: "text", sessionID: "previous", part: { text: "Turn completed; documentation mentions unknown session." } },
+        { type: "step_finish", sessionID: "previous", part: { cost: 0.1, tokens: { input: 5, output: 1 } } },
+      ].map(value => JSON.stringify(value) + "\n").join("");
+      await options.onLog("stdout", stdout);
+      if (stopped) options.onProcessStopped?.();
+      return probeResult({ stdout, ...primary });
+    });
+    const result = await execute({ runId: "run-safe-boundary",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: "previous", sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: commandPath, cwd: configHome, model: "openai/gpt-6.1-sol",
+        captureOpenCodeV2CompactionUsage: true, env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+      context: {}, onLog: async () => {}, onUsage: async receipt => { checkpoints.push(receipt); } });
+    const calls = runProcessMock.mock.calls;
+    expect(calls.filter(call => call[2] !== "node")).toHaveLength(1);
+    const safeRead = stopped && !Object.keys(primary).length;
+    expect(calls.filter(call => call[2] === "node")).toHaveLength(safeRead ? 1 : 0);
+    expect(result.costUsd).toBeNull();
+    expect(result.usageComplete).toBe(false);
+    expect(result.costStatus).toBe("unpriced");
+    expect(checkpoints.at(-1)).toMatchObject({ complete: false, costStatus: "unpriced" });
+  });
+
+  it.each(["truncated stream", "mixed errors", "executed tool", "unconfirmed stop"])(
+    "does not treat ambiguous primary output as a safe missing-session retry (%s)", async kind => {
+      const commandPath = path.join(configHome, "fake-opencode-retry-guard");
+      await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      const error = JSON.stringify({ type: "error", error: { message: "unknown session: previous" } }) + "\n";
+      const tool = JSON.stringify({ type: "tool_use", part: { state: { status: "completed" } } }) + "\n";
+      runProcessMock.mockReset().mockImplementation(async (_run, _target, _command, _args, options) => {
+        const stdout = kind === "executed tool" ? tool + error : kind === "mixed errors"
+          ? error + JSON.stringify({ type: "error", error: { message: "provider failed" } }) + "\n" : error;
+        await options.onLog("stdout", kind === "truncated stream" ? tool + stdout : stdout);
+        if (kind !== "unconfirmed stop") options.onProcessStopped?.();
+        return probeResult({ stdout, exitCode: 1 });
+      });
+      await execute({ runId: "run-retry-guard",
+        agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+        runtime: { sessionId: "previous", sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { command: commandPath, cwd: configHome, model: "openai/gpt-6.1-sol", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+        context: {}, onLog: async () => {} });
+      expect(runProcessMock).toHaveBeenCalledTimes(1);
+    });
+
   it.each([false, true])("keeps chat policy with a legacy OpenCode prompt (custom=%s)", async (custom) => {
     const commandPath = path.join(configHome, "fake-opencode");
     await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
@@ -92,7 +210,10 @@ describe("OpenCode local skill injection", () => {
     const receipt = createPaperclipAssignmentReceipt(context, { companyId: "company-1", agentId: "agent-1", sessionId: "previous" });
     runProcessMock
       .mockReset()
-      .mockResolvedValueOnce(probeResult({ stdout: JSON.stringify({ type: "error", error: "unknown session" }) }))
+      .mockImplementationOnce(async (_run, _target, _command, _args, options) => {
+        options.onProcessStopped?.();
+        return probeResult({ stdout: JSON.stringify({ type: "error", error: "unknown session" }) });
+      })
       .mockResolvedValueOnce(probeResult({ stdout: JSON.stringify({ type: "text", sessionID: "fresh", part: { text: "done" } }) }));
     await execute({
       runId: "run-context-fallback",
