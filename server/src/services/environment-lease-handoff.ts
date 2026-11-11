@@ -55,7 +55,8 @@ export function isReusableLeaseHandoff(previous: Lease, successor: Lease): boole
       (outgoing as Record<string, unknown>)[key] === value) &&
     previous.environmentId && previous.issueId && typeof previous.metadata?.agentId === "string" &&
     previous.companyId === successor.companyId && previous.environmentId === successor.environmentId &&
-    previous.executionWorkspaceId === successor.executionWorkspaceId && previous.issueId === successor.issueId &&
+    previous.executionWorkspaceId === successor.executionWorkspaceId &&
+    (previous.executionWorkspaceId !== null || previous.issueId === successor.issueId) &&
     previous.metadata.agentId === successor.metadata?.agentId && previous.provider === successor.provider &&
     previous.providerLeaseId === successor.providerLeaseId &&
     previous.releasedAt?.getTime() === successor.acquiredAt.getTime() &&
@@ -75,7 +76,8 @@ export function retiredReusableLeasePredecessors(current: Lease, history: Lease[
     const previous = remaining.get(String(receipt.previousLeaseId));
     if (!previous || !isReusableLeaseHandoff(previous, successor) ||
         previous.companyId !== current.companyId || previous.environmentId !== current.environmentId ||
-        previous.executionWorkspaceId !== current.executionWorkspaceId || previous.issueId !== current.issueId ||
+        previous.executionWorkspaceId !== current.executionWorkspaceId ||
+        (current.executionWorkspaceId === null && previous.issueId !== current.issueId) ||
         previous.metadata?.agentId !== current.metadata?.agentId ||
         previous.provider !== current.provider || previous.providerLeaseId !== current.providerLeaseId) return null;
     result.push(previous);

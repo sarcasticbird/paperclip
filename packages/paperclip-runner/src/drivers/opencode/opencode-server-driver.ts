@@ -24,6 +24,7 @@ import { pipeline } from "node:stream/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { parseOpenCodeReasoningMode, type OpenCodeReasoningMode } from "./reasoning-mode.js";
+import { attributeUnsupportedToolMedia } from "./tool-media-attribution.js";
 import { openCodeProviderFailure } from "./provider-failure.js";
 import { createOpenCodeCompanyObservability } from "./company-observability.js";
 import { startOpenCodePerformanceDiagnostics } from "./performance-diagnostics.js";
@@ -1232,8 +1233,10 @@ class OpenCodeHarnessSession implements HarnessSession {
           validation.result.completionClaim.contractRevision !==
           this.#taskEnvelope.completionContract.revision
         ) {
+          // Name the expected revision so the provider can repair its claim
+          // in this turn, as the criteria error below does.
           throw new Error(
-            "Semantic result completion contract revision does not match",
+            `Semantic result completion contract revision does not match. Use contractRevision ${JSON.stringify(this.#taskEnvelope.completionContract.revision)}.`,
           );
         }
         const expectedIds = this.#taskEnvelope.completionContract.criteria.map((criterion) => criterion.id);
@@ -2409,7 +2412,7 @@ async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: s
         }
         chunks.push(Buffer.from(chunk));
       }
-      const body = Buffer.concat(chunks);
+      let body = Buffer.concat(chunks);
       let payload: Record<string, unknown>;
       try { payload = JSON.parse(body.toString("utf8")); }
       catch { response.writeHead(400).end(); return; }
@@ -2418,6 +2421,9 @@ async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: s
         response.writeHead(400).end();
         return;
       }
+      // Keep OpenCode's unreadable-media notice attributed to the tool result
+      // instead of a synthetic user message the model mistakes for the person.
+      if (attributeUnsupportedToolMedia(payload)) body = Buffer.from(JSON.stringify(payload), "utf8");
       const upstream = await new Promise<IncomingMessage>((resolve, reject) => {
         const outgoing = (upstreamUrl.protocol === "https:" ? requestHttps : requestHttp)(upstreamUrl, {
           method: "POST",

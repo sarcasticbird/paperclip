@@ -155,7 +155,7 @@ A heartbeat is ephemeral, not a watcher. Before creating or claiming a monitor, 
 
 Use that request's default full response (not `Prefer: return=minimal`) to confirm `monitorNextCheckAt` is non-null, `assigneeAgentId` is set, `assigneeUserId` is null, and status is eligible — do not issue a confirming GET. Name its actual next check, timeout and attempt bounds; never claim background watching without a saved schedule. Monitors are polling, not event subscriptions.
 
-**Step 9 — Delegate if needed.** For ordinary execution work, create bounded child tasks with complete instructions and explicit project/parent/goal links. Read [Delegating review tasks](WORKFLOWS.md#delegating-review-tasks) and [Issue Dependencies (Blockers)](WORKFLOWS.md#issue-dependencies-blockers) before delegation. A delegate receives its own workspace, not your unsaved checkout. Require reviewers to publish their verdict on their own issue and mark that review done even when adverse; fixes belong to the parent owner. Never require a reviewer to write on the parent, where its run may lack authority. Block the parent on the review when the result is required. Chat handoffs follow Conversation tasks instead of execution-task parenting.
+**Step 9 — Optional task creation.** Continue work on the current issue unless delegation is actually needed and authorized. For ordinary execution work, any child task needs complete instructions and explicit project/parent/goal links. Read [Delegating review tasks](WORKFLOWS.md#delegating-review-tasks) and [Issue Dependencies (Blockers)](WORKFLOWS.md#issue-dependencies-blockers) before delegation. A delegate receives its own workspace, not your unsaved checkout. Require reviewers to publish their verdict on their own issue and mark that review done even when adverse; fixes belong to the parent owner. Never require a reviewer to write on the parent, where its run may lack authority. Block the parent on the review when the result is required. Chat handoffs follow Conversation tasks instead of execution-task parenting.
 
 ## Conditional workflow routing
 
@@ -186,7 +186,7 @@ Before the named action, read the linked section; it contains the unchanged deta
 - **Honor "send it back to me" requests from board users.** If a board/user asks for review handoff (e.g. "let me review it", "assign it back to me"), reassign to them with `assigneeAgentId: null` and `assigneeUserId: "<requesting-user-id>"`, typically setting status to `in_review` instead of `done`. Resolve the user id from the triggering comment's `authorUserId` when available, else the issue's `createdByUserId` if it matches the requester context.
 - **Start actionable work before planning-only closure.** Do concrete work in the same heartbeat unless the task asks for a plan or review only.
 - **Leave a next action.** Every progress comment should make clear what is complete, what remains, and who owns the next step.
-- **Prefer child issues over polling.** Create bounded child issues for long or parallel delegated work and rely on Paperclip wake events or comments for completion.
+- **Do not busy-poll.** For existing delegated work, rely on Paperclip wake events or comments for completion.
 - **Subtasks get their own workspace.** A child issue keeps its parent's project and workspace strategy, but the server always realizes a separate workspace for it from the project base. It never shares the parent's checkout, branch or unsaved files, and `inheritExecutionWorkspaceFromIssueId` does not change that. Share code between tasks through pushed branches or merged changes.
 - **Never cancel cross-team tasks.** If you question the task, follow the requester-directed decision flow in [Receiving cross-team work](references/api-reference.md#receiving-cross-team-work). Keep the task assigned to yourself; do not automatically hand it to a manager.
 - **Use first-class blockers** (`blockedByIssueIds`) rather than free-text "blocked by X" comments.
@@ -230,4 +230,4 @@ Never leave bare ticket ids in issue descriptions or comments when a clickable i
 
 Do NOT use unprefixed paths like `/issues/PAP-123` or `/agents/cto` — always include the company prefix.
 
-**Preserve markdown line breaks (required):** build multiline JSON bodies from heredoc/file input (via the helper in Step 8 or `jq -n --arg comment "$comment"`). Never manually compress markdown into a one-line JSON `comment` string unless you intentionally want a single paragraph.
+**Preserve markdown line breaks (required):** build multiline JSON bodies from heredoc/file input (via the helper in Step 8 or `jq --arg comment "$comment"`). Never manually compress markdown into a one-line JSON `comment` string unless you intentionally want a single paragraph.

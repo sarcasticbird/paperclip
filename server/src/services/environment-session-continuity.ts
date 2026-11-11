@@ -39,7 +39,9 @@ export async function resolveSandboxSessionPredecessor(db: Db, input: {
   const prior = await read(previousId);
   const stop = prior?.lease.metadata?.remoteExecutionTermination as Record<string, unknown> | undefined;
   const confirmedAt = typeof stop?.confirmedAt === "string" ? Date.parse(stop.confirmedAt) : NaN;
-  if (!prior || !isReusableLeaseHandoff(prior.lease, current) ||
+  // A shared workspace may change tasks for upstream warm recovery. That is
+  // not authority to continue another task's saved adapter conversation.
+  if (!prior || prior.lease.issueId !== current.issueId || !isReusableLeaseHandoff(prior.lease, current) ||
       prior.run.companyId !== current.companyId || prior.run.issueId !== current.issueId ||
       prior.run.agentId !== run.agentId || !prior.run.finishedAt ||
       !["succeeded", "failed", "timed_out", "cancelled", "interrupted"].includes(prior.run.status) ||

@@ -11,8 +11,7 @@ function section(body: string, heading: string) {
 }
 
 describe("bounded Paperclip skill entrypoint", () => {
-  it("ships a complete selectable immutable release, not just changed source files", async () => {
-    const source = new URL("../../../skills/paperclip/", import.meta.url);
+  it("preserves the complete selectable deployed V8 release independently of current source", async () => {
     const releases = new URL("../../../skills-releases/paperclip/", import.meta.url);
     const registry = JSON.parse(await readFile(new URL("releases.json", releases), "utf8"));
     const release = registry.find((entry: { id: string }) => entry.id === "v8-bounded-context");
@@ -27,24 +26,29 @@ describe("bounded Paperclip skill entrypoint", () => {
       }
       return result.sort();
     };
-    const names = await files(source);
-    expect(await files(snapshot)).toEqual(names);
+    const names = await files(snapshot);
+    const digest = createHash("sha256");
     for (const name of names) {
-      expect(await readFile(new URL(name, snapshot))).toEqual(await readFile(new URL(name, source)));
+      digest.update(name).update("\0").update(await readFile(new URL(name, snapshot))).update("\0");
     }
+    // Deployed pins keep their admitted bytes. Updating current skill guidance
+    // must not rewrite the historical immutable package to make this test pass.
+    expect(digest.digest("hex")).toBe("9c4c8b1ffdec0e5ca3748ff5e8fe0a08cbf604759bd08175c886ae14af7cba09");
     expect(names).toContain("WORKFLOWS.md");
     expect(names).toContain("scripts/paperclip-issue-update.sh");
   });
 
   it("preserves the complete previous procedures with sibling reference paths intact", async () => {
     const original = (await load("WORKFLOWS.md")).replace("# Paperclip Workflow Reference", "# Paperclip Skill");
-    // Pin the pre-split contract: shortening the entrypoint must not delete a
-    // policy/example from the full reference. Intentional future policy changes
-    // must update this baseline deliberately, not silently drop moved text.
+    // Exact full upstream skill at fa3cd6f3, moved without deleting policy or
+    // examples. Incorporates #20362's stay-on-current-task/access-denial guidance.
     expect(createHash("sha256").update(original).digest("hex"))
-      .toBe("f79532ee8a8df97dd7e239cff0046b3fc00311c8497a0b7dbdd0303f3aee7808");
+      .toBe("94c32785d68feeede0f2951ace9664295199da70aaecee03752403dc4aeb01ee");
     expect(original).toContain("references/api-reference.md");
     expect(original).toContain("scripts/paperclip-upload-artifact.sh");
+    expect(original).toContain("Continue work on the current issue.");
+    expect(original).toContain("If access is denied, report the missing permission on your current task.");
+    expect(original).not.toContain("Courier pattern");
   });
 
   it("bounds repeated root loading without altering authentication or critical rules", async () => {

@@ -24,7 +24,7 @@ Long holds (K4 up to 579 s, so outages up to 588 s, past the Runner's 7-minute r
 
 TTFT, boot and restart recovery stay within the p50 budgets for cold starts and for recovery. The exceptions are claude cold TTFT, at the budget (16.3–17.5 s against 16.5 s), and warm follow-ups on claude (about 3×) and codex (slightly over). See "Speed".
 
-Daytona did not run in this pass. A follow-up adds one Daytona wave. See "Not covered".
+One Daytona wave ran afterwards. It found the claimed-wake leak again, slower remote settling (76–107 s), and a Retry blocked by the company-wide accounting gate. See "Daytona wave".
 
 ## Waves
 
@@ -127,6 +127,90 @@ Findings:
 - Recovery after an outage past the reconnect grace needs its own metric: from `ready` to the first provider event of the run that continues the task (the retry), not of the interrupted run.
 - No change in this phase adds work before `turn.start`. The settle paths run in restart recovery and in the background reconciler.
 
+## Daytona wave (2026-11-08)
+
+One wave ran on Daytona with the same reconciler and budget instrumentation: `w-20261108T012041-s9301`. Its setup:
+- the controller ran at docs head `197e5165a4` (runner content ID `0a65c1e5…`);
+- the signed `image_only` runner image `ghcr.io/paperclipai/paperclip-daytona-runner@sha256:35823e49…` was built from master `1de794c` with the same content ID;
+- 6 tasks on codex, claude and opencode;
+- faults: K2 ×2, K1 ×2, and two long K4 holds (498 s and 399 s, so outages of 575 s and 573 s, past both the 5-minute Daytona auto-stop and the 7-minute reconnect grace);
+- load 10.8–15.5, except the last fault at 60, caused by other sessions' processes.
+
+All 6 tasks crossed a fault and 5 passed. R6 (sandbox leaks) was clean.
+
+- **t03 (claude A1 K2) failed R3 `retry_no_new_run` (P, Phase 3).**
+  - The previous run failed `process_lost`, and the task offered Retry.
+  - The Retry run `7a93bd1e` was cancelled `budget_blocked` by the company-wide accounting gate: "New work must wait while a native run recovers its unfinished accounting."
+  - The same gate skipped assignment wake `c0b2a035` terminally, which is a real I4 (the other I4 in this wave was a delivered retry, the known false positive).
+  - Spend was far below the 3,000-cent cap.
+  - This is the gate that decision 1 removes. The evidence went to the Phase 3 session.
+- **Two runs failed `native_restart_recovery_blocked` (`ambiguous_remote_recovery_evidence`) after the long outages.** Both tasks still finished. Each run left its assignment wake `claimed` until the wave ended (37+ minutes). This is the same leak the K4 local rerun found, and #19934 settles it.
+
+Violations recorded by the reconciler (distinct records):
+
+| Rule | Kind | Records | Settled after `ready` |
+|---|---|---|---|
+| I2 | `wake_request_claimed` | 2 | never (stuck until the end: the #19934 leak) |
+| I2 | `environment_run_lease_active` | 2 | 76–107 s |
+| I2 | `issue_execution_lock`, `issue_checkout_lock` | 2 each | 76–107 s |
+| I2 | `native_pending_workspace_export` | 2 | 98–107 s |
+| I2 | `native_awaiting_evidence` | 2 (`pid_dead`) | 26.5 s |
+| I1 | `environment_pending_cleanup` | 3 | queue item, no owner by design |
+| I1 | `environment_teardown_claim` | 1 | claim written without an owner stamp |
+| I1 | `environment_login_probe_lease` | 1 | no owner stamp |
+| I4 | `wake_request` | 2 | 1 real (accounting gate), 1 false positive |
+
+Remote recovery settles these kinds more slowly than local recovery: 76–107 s after `ready` against under 45 s locally. Gone owners seen while the server was down or recovering (record-passes): `native_executor_claim` 57, `wake_request_claimed` 56, `sandbox_creation_intent` 29.
+
+Speed: remote environments have no budget yet (#19863). These are the first remote numbers, and they are small samples:
+
+| Measure | Value |
+|---|---|
+| Uncrossed runs: opencode cold TTFT | 15.2 s, boot 12.5 s |
+| Uncrossed runs: codex warm boot | 39.8 s (n 1) |
+| Restart recovery from `ready` to the next provider event | claude 37.8 / 42.2 s (n 2), codex 80.3 s (n 1) |
+| Runs with no provider event before the next fault | 4 |
+
+A Daytona budget needs a dedicated remote baseline. Restart recovery is 5–10× the local values.
+
+## Final Daytona wave and Daytona-only crash points (2026-11-08)
+
+**Wave `w-20261108T083036-s9401`.** Setup:
+- controller at master `8475826d2d`;
+- signed `image_only` image `ghcr.io/paperclipai/paperclip-daytona-runner@sha256:c24059f1…` (content ID `abc82e78…`, revision `838e9bf3d2`);
+- 6 tasks;
+- faults: K1, K4 (167 s hold, 175 s outage), K2, K1, K1, K4 (280 s hold, 287 s outage).
+
+All 6 tasks crossed a fault and all 6 passed. The sandbox sweep was clean, and no run breached a budget.
+
+The earlier attempt, `w-20261108T082021`, never started. A skopeo blob read timed out during image extraction, and the retry refused the half-written directory. This is a harness problem, fixed in #20021.
+
+**One real violation: I2 `environment_login_probe_lease` (`pid_dead`), 2 records.**
+- These are run-less leases. The codex agent's harness verification acquires one before any run is admitted.
+- A restart killed the process holding each lease. The lease stayed `active` until the five-minute idle sweep released it.
+- That same idle sweep also releases a live login session's sandbox after five idle minutes.
+- The fix is in PR fix/login-probe-lease-settle. The kind gets a settle that moves the lease to cleanup only once its stamped holder is proven gone. The idle sweep now covers only legacy rows saved before holders were stamped.
+
+**Speed.**
+- Restart recovery from `ready` to the next provider event: claude p50 23.9 s, codex 4.6 s.
+- Codex time from comment to first token on runs that crossed no fault was about 450 s, but boot was about 32 s.
+- The wait came before any run sandbox existed. The tasks launched at 09:55:46, while the first run sandboxes appeared at 10:02:43 (417 s later).
+- In between, the codex agent's harness verification ran in a fresh Daytona sandbox four times (09:55:46, 09:56:27, 09:59:43, 10:02:13). Each fault restarted it, and runs stay queued until verification completes.
+- This is lifecycle admission, not run boot. In a fault-free product it costs one verification per newly hired agent: one sandbox boot plus a hello probe (for comparison, the seed environment probe took 68 s).
+
+**Crash points `cp-20261108T104102`** (Daytona, codex A1). The run took 8.7 min; it reused the cached image.
+
+| Point | Outcome |
+|---|---|
+| `sandbox.create.after_intent_before_provider` | pass, no violations |
+| `sandbox.create.after_provider_before_lease` | pass, no violations |
+| `environment.lease_release.after_provider_before_lease` | not reached: a plain native Daytona run now releases through teardown (the two teardown points below), not this path |
+| `environment.teardown.after_claim_before_destroy` | pass, no violations |
+| `environment.teardown.after_destroy_before_lease` | pass, no violations |
+| `environment.stop_retain.after_claim_before_stop` | not reached: needs a stop-and-retain intent (a native workspace export resume), which no harness workload produces yet |
+
+The R6 sweep found no orphaned sandboxes and no held leases. The first crash-point attempt, `cp-20261108T101304`, exited 2 before any point ran. Cause: the same skopeo timeout, plus a per-run image cache that downloaded the image again. #20021 fixes both.
+
 ## Step 2: kinds moved to the shared path
 
 Order of the moves, highest risk first:
@@ -149,11 +233,12 @@ Phase 3 is not started. It needs a separate go-ahead.
 
 ## Not covered
 
-- **Daytona.** No signed runner image existed for the tested commit.
-  - An apparent content-ID mismatch with CI run 42422571919 was a misreading: that run was dispatched from master but built target commit `a37a2e4`, and its Daytona image step was skipped.
-  - Local content IDs reproduce CI's for the same commit; for example, `35d41f11` gives `11475796…` on both.
-  - A follow-up builds an `image_only` image and adds one Daytona wave.
+- **Daytona** is covered by one wave only (see "Daytona wave"). The first apparent content-ID mismatch was a misreading: CI run 42422571919 built target commit `a37a2e4`, not master. Local content IDs reproduce CI's for the same commit.
 - The remote, workspace-operation, sandbox and accounting kinds (see "Per-kind data").
+- `environment.stop_retain.after_claim_before_stop` is covered since #20049 (`--daytona-reuse-lease`; passed in `cp-20261108T133351`).
+- **Known gap: `environment.lease_release.after_provider_before_lease` is unreached on Daytona.** Native runs release their sandbox through teardown, not this path. Recorded, not pursued.
+- **Known gap: orphans confirmed stopped while `canary/v2026.1108.0-canary.6` or `canary.7` ran.** #19964 shipped without #19976 for about three hours, and those orphans kept no durable marker, so they cannot be told apart from an intentional stop-and-retain. The provider's auto-delete bounds them. A stop still pending at upgrade is covered by #20043. Recorded, not pursued.
+- A replaced container's stamp (Docker, Kubernetes, Fly, a rebooted host) is now provable through the controller instance lease (see `doc/execution-semantics.md`). Boots from before the lease remain unprovable.
 - Crash points that sit between two durable writes. Random waves hit 20 ms–1 s windows only by luck. The crash-point suite (Phase 5) is the tool for those.
 
 ## Reproduce

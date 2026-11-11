@@ -1,4 +1,8 @@
+import { wakeWaitersOfStalledIssues, type BlockerStallWakeup } from "./blocker-stall-wakeups.js";
+import { INTERACTION_DELIVERY_DENIED, isInteractionDeliveryDeniedRun } from "../agent-interaction-delivery.js";
 import { notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";
+import { OWNER_UNPROVABLE_CAUSE } from "./owner-gone-attestation.js";
+import { promoteDeferredWorkIntents } from "../work-intent-outbox.js";
 import { isContextCompactionRun } from "../context-compaction.js";
 import { notifyNativeEnvironmentSettlement } from "../native-environment-settlement-notifications.js";
 import { notifyExternalAgentSettlement } from "../../modules/external-agents/index.js";
@@ -104,12 +108,7 @@ import {
 import { visibleIssueCondition } from "../issue-visibility.js";
 import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
-import {
-  isPidAlive,
-  isProcessGroupAlive,
-} from "../local-service-supervisor.js";
-import { sameProcessSpace } from "../controller-process-identity.js";
-import { ephemeralServerEnabled } from "../ephemeral-server-mode.js";
+import { proveRunProcessGone } from "../run-process-owner.js";
 import { LEGACY_HOST_FALLBACK_EVENT } from "../native-runtime/native-restart-recovery.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { isUniqueViolation } from "../../db-errors.js";
@@ -182,6 +181,7 @@ import {
 import { withRecoveryContext } from "./status-only-context.js";
 import { currentRunFailureText } from "../native-runtime/native-exact-resume-failure.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import { rehomeStrandedLegacyWorkspaceTasks } from "./legacy-workspace-rehome.js";
 import {
   collectDispositionRepairSourceState,
   readDispositionRepairDurableWaitingState,
@@ -248,6 +248,7 @@ type RecoveryWakeupOptions = {
     statuses: string[];
     assigneeAgentId: string;
   };
+  allowRunCoalescing?: boolean;
 };
 
 type RecoveryWakeup = (
@@ -264,6 +265,7 @@ type ResolvedDependencyWakeBackstopOptions = {
   blockerIssueId?: string | null;
   issueId?: string;
   source?: ResolvedDependencyWakeBackstopSource;
+  onDeferredDeadline?: (at: number) => void;
 };
 
 const recoveryRunFields = {
@@ -546,6 +548,7 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
 ]);
 
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
+  INTERACTION_DELIVERY_DENIED,
   "project_access_denied",
   "native_provider_model_rejected",
   "provider_tool_definition_invalid",
@@ -673,7 +676,8 @@ export function classifyAdapterFailureForRecovery(
   if (parsedClockReset) {
     return {
       kind: "provider_quota",
-      retryAt: parsedClockReset,
+      // A calendar reset read after it passed has released the wait.
+      retryAt: parsedClockReset > now ? parsedClockReset : now,
       parsedResetTime: true,
     };
   }
@@ -926,6 +930,13 @@ export function recoveryService(
       run: typeof heartbeatRuns.$inferSelect,
     ) => boolean;
     liveRunExecutions?: Readonly<{ has(id: string): boolean }>;
+    /**
+     * The one settle path for a `running` legacy run whose adapter child is
+     * lost: heartbeat's active-execution reaper (failed/process_lost, with its
+     * retry policy). The stale-lock sweep hands such runs to it instead of
+     * judging process death itself.
+     */
+    settleLostRunProcess?: (scope: { companyId: string; runId: string; onDeferredDeadline?: (at: number) => void }) => Promise<unknown>;
     beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
     beforeStaleLockClear?: (issueId: string) => Promise<void>;
   },
@@ -1178,7 +1189,8 @@ export function recoveryService(
     const selfBlocked = row?.actorType === "agent" && row.agentId === agentId && details.status === "blocked";
     const nativeSelfBlocked = row?.actorType === "system" &&
       row.actorId === "native-status-committer" && row.runAgentId === agentId &&
-      details.source === "native_status_decision" && details.toStatus === "blocked";
+      details.source === "native_status_decision" && details.toStatus === "blocked" &&
+      details.reasonCode !== "durable_dependency_blocker_bound";
     if (!selfBlocked && !nativeSelfBlocked) return false;
     const newlyCompletedBlocker = await db.select({ id: issues.id }).from(issues).where(and(
       eq(issues.companyId, companyId),
@@ -1188,8 +1200,10 @@ export function recoveryService(
     if (newlyCompletedBlocker.length > 0) return false;
     const newlyFinalizedBlocker = await db.select({ id: workspaceOperations.id }).from(workspaceOperations)
       .innerJoin(issues, and(eq(issues.companyId, companyId), inArray(issues.id, blockerIssueIds),
-        eq(issues.executionWorkspaceId, workspaceOperations.executionWorkspaceId),
-        eq(workspaceOperations.issueId, issues.id)))
+        eq(workspaceOperations.issueId, issues.id),
+        or(eq(issues.executionWorkspaceId, workspaceOperations.executionWorkspaceId),
+          and(isNull(workspaceOperations.executionWorkspaceId),
+            sql`${workspaceOperations.metadata}->>'owningService' = 'workspace_recovery'`))))
       .where(and(eq(workspaceOperations.companyId, companyId), eq(workspaceOperations.phase, "workspace_finalize"),
         eq(workspaceOperations.status, "succeeded"), gt(workspaceOperations.finishedAt, blockedTransitionAt)))
       .limit(1);
@@ -3463,6 +3477,11 @@ export function recoveryService(
   }
 
   async function reconcileActiveRecoveryActions(opts?: { companyId?: string }) {
+    // A blocked subtask that an older release bound to a relative's held
+    // workspace moves to its own workspace and continues (its board escalation
+    // is an active recovery action, so this company-scoped sweep reaches it).
+    const rehome = await rehomeStrandedLegacyWorkspaceTasks(db, deps.enqueueWakeup, { companyId: opts?.companyId })
+      .catch(error => { logger.warn({ err: error }, "Legacy shared-workspace rehome deferred to the next sweep"); return null; });
     const rows = await db
       .select({
         action: issueRecoveryActions,
@@ -3487,6 +3506,12 @@ export function recoveryService(
       issueIds: [] as string[],
     };
     for (const { action, issue } of rows) {
+      // Only the board's stop confirmation, or the resource's own release, settles this request:
+      // the reserved resource stays reserved however the task ends.
+      if (action.cause === OWNER_UNPROVABLE_CAUSE) {
+        result.skipped += 1;
+        continue;
+      }
       if (await hasUnverifiedNativeWorkspaceFinalizationOwner(db, action)) {
         result.skipped += 1;
         continue;
@@ -3625,7 +3650,13 @@ export function recoveryService(
       // longer schedules another agent-owned wake for them.
       result.skipped += 1;
     }
-    return result;
+    // A child or blocker stalled on a board-owned action: tell whoever waits on it, once per stall.
+    const stalls = await wakeWaitersOfStalledIssues(db, deps.enqueueWakeup as BlockerStallWakeup, { companyId: opts?.companyId });
+    // A failed delivery is reported so the recovery worker retries this pass.
+    // The earliest owed wake of a moved legacy subtask is a deadline of this pass too.
+    const retryAts = [stalls.retryAt, rehome?.nextWakeRetryAt].filter((at): at is number => typeof at === "number");
+    return { ...result, blockerStallWakes: stalls.woken, blockerStallWakeFailures: stalls.failed,
+      blockerStallRetryAt: retryAts.length ? Math.min(...retryAts) : null };
   }
 
   async function escalateDispositionRepair(input: {
@@ -4595,7 +4626,8 @@ export function recoveryService(
         }
         if (!(await instanceSettingsService(db).getExperimental()).enableAgentChat) { result.skipped += 1; continue; }
         {
-          if (await deliverConversationComments(db, issue, deps.enqueueWakeup) === "deferred") {
+          if (await deliverConversationComments(db, issue, deps.enqueueWakeup,
+            { onDeferredDeadline: opts?.onDeferredDeadline }) === "deferred") {
             result.skipped += 1;
             continue;
           }
@@ -4634,6 +4666,10 @@ export function recoveryService(
       }
 
       let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+      if (latestRun?.agentId === agentId && isInteractionDeliveryDeniedRun(latestRun)) {
+        result.skipped += 1;
+        continue;
+      }
       // Terminal run/wake rows survive a restart even if finalization never
       // reached the escalation transaction. Retry that idempotent disposition
       // before the participant-only review branch can skip pathless reviews.
@@ -4704,6 +4740,16 @@ export function recoveryService(
         latestRun?.agentId === agentId &&
         latestRun.status === "cancelled" &&
         (latestRun.errorCode === "agent_paused" || isOperatorCancelledRun(latestRun, agentId))
+      ) {
+        result.skipped += 1;
+        continue;
+      }
+      if (
+        agent?.status === "paused" &&
+        agent.companyId === issue.companyId &&
+        agent.lifecycleHolds.includes("manual") &&
+        issue.status === "todo" &&
+        !latestRun
       ) {
         result.skipped += 1;
         continue;
@@ -4793,6 +4839,10 @@ export function recoveryService(
         issue.status === "in_review"
           ? participantLatestRunForRecovery
           : latestRun;
+      if (isInteractionDeliveryDeniedRun(executionRecoverySource)) {
+        result.skipped += 1;
+        continue;
+      }
       if (
         executionRecoverySource?.agentId === agentId &&
         (
@@ -6066,6 +6116,16 @@ export function recoveryService(
       );
     }
 
+    // A stalled child or blocker: tell whoever waits on it, once per stall
+    // (blocker-stall-wakeups.ts). This sweep visits each blocked issue, which
+    // covers a board action already resolved as "blocked".
+    if (!opts?.runId && !opts?.blockerIssueId) {
+      const stalls = await wakeWaitersOfStalledIssues(db, deps.enqueueWakeup as BlockerStallWakeup,
+        { companyId: opts?.companyId ?? null, issueId: opts?.issueId ?? null });
+      // Counted with the dependency wakes, so the worker retries a failed one.
+      result.enqueueFailed += stalls.failed;
+      if (stalls.retryAt !== null) opts?.onDeferredDeadline?.(stalls.retryAt);
+    }
     return result;
   }
 
@@ -6094,9 +6154,12 @@ export function recoveryService(
   //   authority that catches the reuse-lease path: the release stops the sandbox
   //   but keeps the server process alive, so the in-memory handle and the
   //   recorded pid can both persist.
-  // - Process-death authority: the run has no in-memory handle and its recorded
-  //   process and process group are both gone. This catches a hard server crash
-  //   that skipped the graceful teardown, even when the issue is not terminal.
+  // - Process death: the run has no in-memory handle and the shared owner
+  //   prover finds its recorded child gone. A legacy run is handed to the one
+  //   lost-process settle path (heartbeat's active-execution reaper), so it
+  //   gets the same failed/process_lost outcome and retry as any other lost
+  //   child. A native run keeps this backstop's interrupted outcome; native
+  //   recovery owns its retries.
   async function terminalizeOrphanedRunningRun(
     run: typeof heartbeatRuns.$inferSelect,
     options?: {
@@ -6182,24 +6245,28 @@ export function recoveryService(
     // group. Require recorded process metadata, so this authority never fires
     // on a run that has not yet stored its pid.
     let processGone = false;
+    let legacyHostFallback = false;
     const hasLiveExecution =
       deps.liveRunExecutions?.has(run.id) ?? runningProcesses.has(run.id);
-    // A recorded PID is judged only in the PID space that recorded it: a dead
-    // local PID never proves that a process on another host, in another
-    // namespace, or in a sandbox ("remote") is gone. Rows saved before the
-    // space was recorded keep the previous local proof for one release, and
-    // only on a single-host server: an ephemeral server cannot assume the
-    // row was written here. Its operator path is the run's Stop control.
-    const legacyHostFallback = run.processHostHash == null && !ephemeralServerEnabled();
-    const processSpaceJudgeable = legacyHostFallback || sameProcessSpace(run.processHostHash);
-    if (!hasLiveExecution && processSpaceJudgeable) {
-      if (typeof pid === "number" || typeof processGroupId === "number") {
-        const processAlive =
-          (typeof pid === "number" && isPidAlive(pid)) ||
-          (typeof processGroupId === "number" &&
-            isProcessGroupAlive(processGroupId));
-        processGone = !processAlive;
-      }
+    if (!issueTerminalStatus && !hasLiveExecution && run.runtimeMode !== "native") {
+      // The lost-process settle path proves the child itself and owns the
+      // outcome. Without it (a bare recovery service) nothing is judged here.
+      if (!deps.settleLostRunProcess) return { terminalized: false, status: run.status };
+      await deps.settleLostRunProcess({ companyId: run.companyId, runId: run.id,
+        onDeferredDeadline: options?.onDeferredDeadline });
+      const [current] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id)));
+      const status = current?.status ?? run.status;
+      return { terminalized: status !== run.status && TERMINAL_HEARTBEAT_RUN_STATUSES.has(status), status };
+    }
+    // The shared owner prover judges a recorded PID only in the PID space that
+    // recorded it (#19871). Rows saved before the space was recorded keep the
+    // previous local proof for one release, on single-host servers only. An
+    // unprovable child is never released here; its operator path is Stop.
+    if (!hasLiveExecution) {
+      const proof = await proveRunProcessGone(run, "orphaned_running_run");
+      processGone = proof?.verdict === "gone";
+      legacyHostFallback = proof?.legacyHostFallback === true;
     }
 
     // Neither authority applies. The run is still live, so leave it alone.
@@ -6535,7 +6602,7 @@ export function recoveryService(
         }
         await notifyUnsafeWorkspaceExportRecovery(tx, { companyId: issue.companyId, issueId: issue.id });
         await notifyNativeStatusReassessment(tx, { companyId: issue.companyId, issueId: issue.id });
-        return tx
+        const cleared = await tx
         .update(issues)
         .set({
           checkoutRunId: null,
@@ -6561,6 +6628,12 @@ export function recoveryService(
         )
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
+        // Releasing the lock is a hold-release event: messages saved behind it
+        // are promoted through the one outbox path (section E), only when the
+        // guarded clear actually released it. The promotion registers its own
+        // work signals before its write.
+        if (cleared) await promoteDeferredWorkIntents(tx, { companyId: issue.companyId, trigger: "lock_released", issueId: issue.id });
+        return cleared;
       });
 
       if (!updated) continue;

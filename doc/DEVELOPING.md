@@ -114,6 +114,21 @@ until an explicit close-readiness or lifecycle inspection computes it. Workspace
 detail reads also return unknown delivery state without running Git or contacting
 a storage provider. Use close-readiness for current Git safety checks.
 
+### Remote CLI-adapter incomplete accounting
+
+Remote CLI-adapter runs use the existing incomplete-settlement owner after a
+terminal failure, cancellation, timeout or interruption: their controller lease
+and control deadline must be cleared, no process identity may remain, no future
+retry may be scheduled, and every allocation must carry its exact company/run/
+lease-bound termination receipt. Terminal status or a missing PID alone is not
+closure proof. Existing saved adapter runs with that evidence are eligible
+without relabeling their runtime or rewriting their history. Their final usage
+remains incomplete; known cost is an explicit lower-bound estimate and later
+complete receipts still reconcile through the normal ledger. Local or unproven
+producers retain the hold. This retains the fork's focused accounting note from
+the retired implementation specification without restoring that upstream-deleted
+document.
+
 ### OpenCode assignment delivery and bounded resumes
 
 Task Markdown owns the brief; the structured wake owns current events. The server
@@ -583,6 +598,28 @@ no remote metadata requests. Run its light/dark desktop/mobile checks with:
 ```sh
 STORYBOOK_TEST_BASE_URL=http://localhost:6006 pnpm exec playwright test inline-links.spec.ts --config=tests/storybook-visual/playwright.config.ts --project=stories
 ```
+
+**Link previews** mounts the same Markdown renderer with its production preview
+provider. A delayed hover or keyboard focus requests PR metadata. Repeated PR URLs,
+including diff links and fragments, share a viewer/company-scoped query. The card
+stays aligned with the link, and the exact navigation URL stays intact. The stories
+simulate the API response for open, merged, conflicts, draft, closed, loading,
+unavailable and failed reads, with a narrow long-title example. Run:
+
+```sh
+STORYBOOK_TEST_BASE_URL=http://localhost:6006 pnpm exec playwright test link-previews.spec.ts --config=tests/storybook-visual/playwright.config.ts --project=stories
+```
+
+The board-only `GET /api/companies/:companyId/link-preview?url=...` is optional
+enrichment, independent of the External Objects experiment. Its GitHub adapter
+uses the viewer's eligible managed connection, then the existing company/public
+credential path only when no managed connection is configured. Personal results
+remain in bounded, process-local viewer/company caches and are never persisted as
+company external objects. Successful responses live for one minute; unavailable
+responses use a short negative cache or GitHub's retry window. Reads have an
+abortable deadline and a bounded concurrency budget. Nothing polls while idle.
+The browser neither retries these reads nor refreshes them on window focus.
+These stories do not verify live GitHub authentication.
 
 **Task chat → Failure notices** covers compact run errors and adjacent recovery
 notices in both presentation modes, with expanded details, fixture retry
@@ -1101,8 +1138,10 @@ npx paperclipai allowed-hostname dotta-macbook-pro
 ## Agent status recovery
 
 Lifecycle verification stops automatic attempts after missing authentication,
-an unavailable model or command, an invalid working directory, or unexpected
-probe output. A generic failed test gets up to three failures before automatic
+an unavailable model or command, an invalid working directory, unexpected
+probe output, or an owned AI account selection refusal. Account selection guidance
+names missing defaults, unavailable accounts, incompatible bindings, missing
+responsible users, or credential sharing requirements without provider error text. A generic failed test gets up to three failures before automatic
 checks stop. The saved `verificationFailures` count only advances when the host
 verification test fails; claims deferred before the test do not spend that budget.
 An explicit retry or execution configuration change resets that count.
@@ -1150,6 +1189,15 @@ orphan recovery.
 pnpm exec vitest run server/src/services/heartbeat/agent-status.test.ts server/src/__tests__/heartbeat-agent-status-recovery.test.ts
 ```
 
+## Task document bodies
+
+The native `write_document` tool preserves the supplied Markdown body, including
+leading whitespace, hard-break spaces, line endings, and final newlines. It still
+requires a nonblank body and normalizes key/title fields. `write_task_document`
+and REST document PUT also retain surrounding whitespace. Those REST-backed
+paths keep their existing escaped-line-break normalization: a body with no real
+line breaks can have literal `\n` sequences converted to newlines.
+
 ## Test Commands
 
 The [feature map](../maps/feature-map/README.md) is an optional reference for user
@@ -1171,12 +1219,19 @@ Prepare a new or updated agent worktree with one command:
 node scripts/agent-preflight.mjs
 ```
 
-It does what `pnpm install --frozen-lockfile`, the Runner's `ensure:eval-build-deps`,
-`build:rust`, `build` and `build:runner-binaries` did, and skips work whose inputs
-are unchanged:
+It does what `pnpm install --frozen-lockfile`, the plugin SDK's `ensure-build-deps`,
+the Runner's `ensure:eval-build-deps`, `build:rust`, `build` and
+`build:runner-binaries` did, and skips work whose inputs are unchanged:
 
 - **install** is skipped when the lockfile, every `package.json`, `patches/`, Node
   and pnpm match this worktree's last install.
+- **plugin SDK build** runs `scripts/ensure-plugin-build-deps.mjs`, which builds
+  `@paperclipai/plugin-sdk` and its `@paperclipai/shared` dependency and skips
+  them when their content fingerprints match the last build. Like the Runner and
+  the eval kernel, the SDK is imported through its built `dist` (plugin workers
+  load it under plain Node), so the server and the restart-chaos harness cannot
+  start without it. Both compile in about two seconds, so they do not use the
+  shared cache.
 - **Runner build** is skipped when the Runner's build stamp is current. When another
   worktree built the same inputs (the build-input digest described under
   "Reused Runner build in the server build", plus the compiler), the Runner and eval
@@ -2398,8 +2453,7 @@ for storage, import, retention, and lifecycle regression checks. These checks do
 not qualify a deployed Runner/provider or a zero-outage webserver deploy. Keep
 the existing persistent volume until the other instance data paths and deploy
 handoff are separately qualified. See the
-[implementation contract](SPEC-implementation.md#experimental-native-remote-workspace-authority-2026-10-30)
-and [snapshot storage contract](DATABASE.md#experimental-remote-workspace-snapshots).
+[snapshot storage contract](DATABASE.md#experimental-remote-workspace-snapshots).
 
 ## Agent Artifact Uploads
 
@@ -2653,7 +2707,7 @@ The default `worktree init` still seeds eagerly. A lean worktree (created withou
 
 - `pnpm paperclipai worktree ensure-seeded` performs the deferred seed **exactly once**. It is lock-guarded and idempotent: only a complete `verified` manifest short-circuits it, so it is safe to call repeatedly and from concurrent processes. Managed workspaces derive the source from the control-plane-provided base project workspace when it carries its own `.paperclip/config.json`, and otherwise from the control plane's own registered instance config; either way the workspace's manifest never selects it. Manual worktrees must pass `--from-config`.
 - `paperclipai run` calls `ensureWorktreeSeeded` automatically before doctor/boot. Managed runs transparently seed a lean worktree from their registered base workspace; an unmanaged lean worktree must first run `worktree ensure-seeded --from-config <source-config>`.
-- Managed Paperclip git worktrees default to the repository's `scripts/provision-worktree.sh` when the strategy omits `provisionCommand`. When a registered source config exists, setup creates the isolated config and pending manifest. Runtime startup also runs `scripts/provision-worktree-runtime.sh` automatically when no explicit runtime provision command is configured and the manifest is not verified. Explicitly configured provision commands still take precedence.
+- Managed git worktrees run a repository's `scripts/provision-worktree.sh` when the strategy omits `provisionCommand` and that file exists. The Paperclip repository deliberately does not ship a file at that path, so agent turns in Paperclip worktrees do not wait on dependency installs or instance setup. Its setup script is `scripts/setup-paperclip-worktree.sh`: run it by hand, or set it as the project's `provisionCommand` to opt in. When a registered source config exists, it creates the isolated config and pending manifest, then installs dependencies. Runtime startup still runs `scripts/provision-worktree-runtime.sh` automatically when no explicit runtime provision command is configured and the manifest is not verified; that script runs `scripts/setup-paperclip-worktree.sh` first when the worktree has no config. Explicitly configured provision commands still take precedence.
 - An environment-configured server may have no local seed config. If neither the base checkout nor the default control-plane instance has one, a fresh worktree prepares its dependencies without creating a development instance. This also applies when `PAPERCLIP_CONFIG` names the default `$PAPERCLIP_HOME/instances/$PAPERCLIP_INSTANCE_ID/config.json` path, as the Docker image does. Setup creates no config, environment file, or seed manifest and does not claim runtime or seed readiness. A later request for a seeded development runtime still needs a canonical registered source config. Once that source exists, provisioning the checkout again creates the development instance normally.
 - A missing custom `PAPERCLIP_CONFIG`, rejected symlink, or non-regular source file still fails setup. An existing worktree with a config, environment file, or seed state also fails if its source disappears; setup never downgrades that instance to a plain checkout. Repair the source before retrying.
 - The built-in deferred seed is recorded as its own terminal `workspace_seed` operation. A zero exit code is not enough for success: the operation succeeds only when `.paperclip/seed-manifest.json` contains complete verified evidence; failed, missing, or malformed manifests produce a failed operation with the seed phase in metadata.
@@ -3245,6 +3299,10 @@ Saved OpenCode agents keep their runner and runtime policies.
 Plugin environment drivers can declare `requiresAgent: true` when their leases
 need an agent-owned resource. The host selects that plugin's lifecycle work only for
 agents on that environment. See [Required plugin work](./AGENT-LIFECYCLE.md#required-plugin-work).
+Moving a ready agent to an environment that needs a new plugin automatically
+pauses execution, waits for stop completion, starts the required resources, and
+verifies the saved configuration before allowing work. Existing pause holds
+still apply; the user does not need to pause or resume the agent for this move.
 Setup saves the draft and environment, runs its
 existing lifecycle preparation, and waits in `verifying` with the `setup` hold.
 The worker becomes idle there until the user finishes hiring. Connection tests
@@ -4746,8 +4804,9 @@ whether or not anything is left to compact.
 
 A compacted worktree is in the same state as a freshly created one, so when the
 task resumes, whatever produced those files the first time produces them again:
-reuse runs the workspace provision command (or `scripts/provision-worktree.sh`),
-which reinstalls dependencies when `node_modules` is missing. Repositories without
+reuse runs the workspace provision command (or a repository's
+`scripts/provision-worktree.sh`), which can reinstall dependencies when
+`node_modules` is missing. Repositories without
 a provision command rely on the agent's own install step, as they do for a new
 worktree.
 
@@ -5218,6 +5277,14 @@ The browser saves a small read cache in `paperclip:query-cache:v1:*` local stora
 
 Restored identity permits cached display only. Restored inline task drafts compare their saved base with a fresh field read before each replay; conflicting edits stay in the editor for review. Account-bound writes wait for a fresh server session and are cancelled if its user changes. A definitive session denial removes saved account reads. Service-worker updates reload hidden tabs only after connectivity is online and mutations, durable sends and autosaves have settled. Durable queues synchronously report each unresolved operation, including the intervals between online rate-limit retries. Sign-out revocation also works on plain-HTTP installs without `crypto.randomUUID`.
 
+The read cache also retains up to 100 learned link previews for the current user
+and accessible companies, including unavailable results. Reloading restores the
+last known PR status without a provider request. Preview timestamps keep their
+original age: hover or keyboard focus reuses a fresh result and refreshes a stale
+one. Stale status stays visible until then. Preview retention uses the same
+24-hour expiry, build boundary, membership checks, and sign-out cleanup as other
+saved reads. It does not add polling or fetch every PR on page load.
+
 Embedded plan documents and preview work products are stripped from saved payloads. A denied task clears its UUID and identifier projections. Sign-out revocation markers contain no task content and remain after sign-out to reject stale records and delayed writes from older tabs. Session responses started before revocation cannot restore those reads, even before the storage event reaches the other tab.
 
 Cached agents retain only safe adapter display fields and an empty runtime configuration. Their configuration objects remain present for existing display consumers; provider credentials and environment values are excluded.
@@ -5250,3 +5317,33 @@ failure remains retryable even when the clone directory already exists. Later
 workspace saves retain repository coverage only for directories present in the
 captured archive. Deleted checkouts lose coverage and can be acquired again.
 A failed batch upload marks the affected repository rows as needing repair.
+
+### Native Runner credential refreshes
+
+Core handles PRP `auth.credentials.updated` notifications for managed Codex and
+Grok subscriptions across local, SSH, sandbox, and supported plugin Runner tasks.
+After validating the company, agent, run, session, and Runner binding, it exports
+the selected account and writes newer credentials directly to the tenant secret.
+Grant, secret, version-selector, session-epoch, and provider freshness checks are
+shared across execution targets. Explicit reconnects and revoked grants win over
+old refreshes. Providers that do not emit this event keep their existing flow;
+operator-owned homes do not acquire tenant writeback authority.
+
+The transport's credential handler rebinds with each warm invocation, including
+its current target exporter. Idle refreshes and recovered controller handles do
+not depend on a completed invocation's temporary home. Detached handles cannot
+process new updates. Native/ACPX Codex and Grok use bounded, descriptor-based file
+reads; SSH and sandbox readers use the Node runtime already required by remote
+isolated-home preparation. Plugin tasks use their account-bound export operation.
+
+A notification is acknowledged only after writeback succeeds or its authority is
+intentionally discarded. Export and database failures replay through PRP. An
+unchanged managed-subscription turn does no credential export or database write.
+Retirement keeps a final export for legacy and recovery paths; a failed final
+export retains the provider's credential files for retry. After verified provider
+exit, ACPX Codex and Grok preserve a private `auth-refresh.json` handoff before
+scrubbing `auth.json`; Core removes it after retirement writeback. Plugin retirement also
+records rotation, unchanged credential, changed binding, undispatched task, or a
+null export. No secret bytes appear in PRP events or lease metadata. The plugin
+provider must support live account-bound exports before enabling the paired Core
+handler.
