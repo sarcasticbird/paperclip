@@ -131,3 +131,15 @@ export function isOpenCodePreDispatchSessionRejection(stdout: string): boolean {
   const message = errorText(event.error ?? event.message).trim();
   return /^(?:unknown\s+session(?:\s+id)?|session\s+not\s+found)(?:\s*:[^\n]*|\s+[a-zA-Z0-9_-]+)?\s*$/i.test(message);
 }
+
+/** Legacy stderr may clear an exact stale reference, never authorize resend.
+ * Generic NotFoundError text can refer to a tool's files, not the session. */
+export function isOpenCodeLegacySessionRejection(stderr: string, sessionId: string): boolean {
+  const lines = stderr.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  if (lines.length !== 1) return false;
+  const error = /^NotFoundError: Resource not found: (.+)$/i.exec(lines[0]!);
+  const file = error?.[1]?.replaceAll("\\", "/");
+  if (!file || file.split("/").some(part => part === "." || part === "..")) return false;
+  const match = /^(?:[a-z]:)?\/(?:[^/\r\n]+\/)*storage\/session\/[^/\r\n]+\/([a-zA-Z0-9_-]+)\.json$/i.exec(file);
+  return match?.[1] === sessionId;
+}

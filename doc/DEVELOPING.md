@@ -3581,6 +3581,18 @@ by selecting a different GitHub identity. Regression coverage lives in
 `execute-sandbox-session.test.ts`; local bridge tests are not exact-guest release
 qualification.
 
+### Legacy OpenCode stale-session disposition
+
+A stderr-only `NotFoundError: Resource not found: .../storage/session/<project>/<session>.json`
+can clear the saved session reference only when it names the requested session,
+the provider confirms termination, the exit is failed, and complete observed
+output contains no execution evidence. Mixed/truncated output, another missing
+resource, timeout, signal or transport failure retain the reference. This path
+returns the original failed run with `clearSession: true`; it never resends the
+turn. Missing compaction accounting stays incomplete/unpriced. A subsequent run
+still requires ordinary Paperclip admission. The existing isolated structured
+pre-dispatch rejection fallback is unchanged.
+
 ### Native runner restart recovery
 
 An explicit Retry can continue a recovered setup failure that began as a

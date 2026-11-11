@@ -792,10 +792,13 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(f.deps.finalizeAgentStatus).toHaveBeenCalledOnce();
   });
 
-  it("clears only the completed task session when the adapter requests a reset", async () => {
+  it.each([0, 1])("clears only the completed task session when the adapter requests a reset (exit=%s)", async exitCode => {
     const f = await fixture();
     f.input.adapterResult.clearSession = true;
+    f.input.adapterResult.exitCode = exitCode;
+    if (exitCode) f.input.adapterResult.errorMessage = "Saved session file was rejected";
     await f.completion.completeRun(f.input);
+    expect((await read(f.run.id)).status).toBe(exitCode ? "failed" : "succeeded");
     expect(f.deps.clearTaskSessions).toHaveBeenCalledWith(f.run.companyId, f.agent.id, { taskKey: "completion-task", adapterType: "process", expectedRunId: f.run.id });
     expect(f.deps.upsertTaskSession).not.toHaveBeenCalled();
   });

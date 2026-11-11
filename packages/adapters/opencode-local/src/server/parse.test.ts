@@ -1,5 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { parseOpenCodeJsonl, isOpenCodeUnknownSessionError } from "./parse.js";
+import { parseOpenCodeJsonl, isOpenCodeUnknownSessionError, isOpenCodeLegacySessionRejection } from "./parse.js";
+
+describe("legacy session rejection evidence", () => {
+  it.each([
+    ["/Users/test/.local/share/opencode/storage/session/project/ses_missing.json", true],
+    ["C:\\Users\\test\\opencode\\storage\\session\\project\\ses_missing.json", true],
+    ["/data/storage/session/project/ses_other.json", false],
+    ["/data/storage/message/project/ses_missing.json", false],
+    ["/data/storage/session/project/../../other/ses_missing.json", false],
+    ["relative/storage/session/project/ses_missing.json", false],
+  ] as const)("only identifies the exact session storage file %s", (file, expected) => {
+    expect(isOpenCodeLegacySessionRejection(`NotFoundError: Resource not found: ${file}`, "ses_missing")).toBe(expected);
+  });
+  it.each(["Tool said: ", "Other failure\n"])("rejects diagnostic context around the legacy error: %j", prefix => {
+    expect(isOpenCodeLegacySessionRejection(`${prefix}NotFoundError: Resource not found: /data/storage/session/project/ses_missing.json`, "ses_missing")).toBe(false);
+  });
+});
 
 describe("parseOpenCodeJsonl", () => {
   it("parses assistant text, usage, cost, and errors", () => {

@@ -167,6 +167,62 @@ describe("OpenCode local skill injection", () => {
       expect(runProcessMock).toHaveBeenCalledTimes(1);
     });
 
+  it.each([false, true])("clears a confirmed legacy missing session without resending the turn (capture=%s)", async capture => {
+    const sessionId = "ses_missing";
+    const stderr = `NotFoundError: Resource not found: /Users/test/.local/share/opencode/storage/session/project/${sessionId}.json`;
+    const commandPath = path.join(configHome, "fake-opencode-legacy-rejection");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    runProcessMock.mockReset().mockImplementation(async (_run, _target, command, _args, options) => {
+      if (command === "node") return probeResult({ stdout: "" });
+      await options.onLog("stderr", stderr);
+      options.onProcessStopped?.();
+      return probeResult({ exitCode: 1, stderr });
+    });
+    const result = await execute({ runId: "legacy-session-rejection",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId, sessionParams: { sessionId, cwd: configHome }, sessionDisplayId: sessionId, taskKey: "issue-1" },
+      config: { command: commandPath, cwd: configHome, model: "openai/gpt-6.1-sol",
+        captureOpenCodeV2CompactionUsage: capture, env: { OPENCODE_ALLOW_ALL_MODELS: "1" } }, context: {}, onLog: async () => {} });
+    const invocations = runProcessMock.mock.calls.filter(call => call[2] === commandPath);
+    expect(invocations).toHaveLength(1);
+    expect(runProcessMock).toHaveBeenCalledTimes(capture ? 2 : 1);
+    expect(invocations[0]![3]).toContain(sessionId);
+    expect(result).toMatchObject({ exitCode: 1, clearSession: true, sessionId: null,
+      sessionParams: null, sessionDisplayId: null, usageComplete: false, costStatus: "unpriced" });
+    expect(result.resultJson?.stderr).toBe(stderr);
+    expect(result.errorMessage).toBeTruthy();
+  });
+
+  it.each(["unconfirmed stop", "timeout", "signal", "transport", "unknown exit", "negative exit", "successful exit",
+    "mixed stdout", "streamed stdout", "mixed stderr", "truncated stderr", "other session", "other resource", "generic notfound"])(
+    "retains session identity for ambiguous legacy rejection evidence (%s)", async fault => {
+    const sessionId = "ses_missing";
+    const rejection = `NotFoundError: Resource not found: /Users/test/.local/share/opencode/storage/session/project/${sessionId}.json`;
+    const stderr = fault === "mixed stderr" ? `Other operation failed\n${rejection}`
+      : fault === "other session" ? rejection.replace(sessionId, "ses_other")
+      : fault === "other resource" ? rejection.replace("/storage/session/", "/storage/message/")
+      : fault === "generic notfound" ? "NotFoundError: Resource not found: /workspace/project/data.json" : rejection;
+    const stdout = fault === "mixed stdout" ? JSON.stringify({ type: "tool_use", sessionID: sessionId }) : "";
+    const commandPath = path.join(configHome, "fake-opencode-ambiguous-rejection");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    runProcessMock.mockReset().mockImplementation(async (_run, _target, _command, _args, options) => {
+      if (fault !== "unconfirmed stop") options.onProcessStopped?.();
+      await options.onLog("stdout", fault === "streamed stdout" ? "earlier provider activity\n" : stdout);
+      await options.onLog("stderr", fault === "truncated stderr" ? `Earlier diagnostic\n${stderr}` : stderr);
+      return probeResult({ stdout, stderr, exitCode: fault === "unknown exit" ? null : fault === "negative exit" ? -1 : fault === "successful exit" ? 0 : 1,
+        timedOut: fault === "timeout", signal: fault === "signal" ? "SIGTERM" : null,
+        ...(fault === "transport" ? { errorCode: "duplex_channel_lost" } : {}) });
+    });
+    const result = await execute({ runId: "ambiguous-legacy-rejection",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId, sessionParams: { sessionId }, sessionDisplayId: sessionId, taskKey: "issue-1" },
+      config: { command: commandPath, cwd: configHome, model: "openai/gpt-6.1-sol",
+        env: { OPENCODE_ALLOW_ALL_MODELS: "1" } }, context: {}, onLog: async () => {} });
+    expect(runProcessMock).toHaveBeenCalledTimes(1);
+    expect(result.clearSession).not.toBe(true);
+    if (fault !== "timeout") expect(result.sessionId).toBe(sessionId);
+  });
+
   it.each([false, true])("keeps chat policy with a legacy OpenCode prompt (custom=%s)", async (custom) => {
     const commandPath = path.join(configHome, "fake-opencode");
     await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });

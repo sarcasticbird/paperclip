@@ -58,7 +58,7 @@ import {
   readPaperclipIssueWorkModeFromContext,
   resolveLegacyPaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
-import { parseOpenCodeJsonl, createOpenCodeJsonlParser, isOpenCodePreDispatchSessionRejection } from "./parse.js";
+import { parseOpenCodeJsonl, createOpenCodeJsonlParser, isOpenCodePreDispatchSessionRejection, isOpenCodeLegacySessionRejection } from "./parse.js";
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
   isTruthyEnvFlag,
@@ -706,6 +706,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       let processStopped = false;
       const primaryDigest = createHash("sha256");
       let primaryBytes = 0;
+      const stderrDigest = createHash("sha256");
+      let stderrBytes = 0;
       const recordProviderStop = providerStop.beginInvocation();
       const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
         onProcessStopped: () => { processStopped = true; recordProviderStop(); },
@@ -722,6 +724,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         onRuntimeProgress: ctx.onRuntimeProgress,
         onLog: async (stream, chunk) => {
           if (stream === "stdout") { primaryDigest.update(chunk); primaryBytes += Buffer.byteLength(chunk); }
+          else { stderrDigest.update(chunk); stderrBytes += Buffer.byteLength(chunk); }
           await accountingLog(stream, chunk);
         },
         runLogTail: paperclipBridge?.runLogTail,
@@ -737,9 +740,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // Only a primary, pre-execution session rejection may authorize fallback.
       // Auxiliary diagnostics and arbitrary assistant/tool text are never retry
       // evidence, even when they contain a missing-session phrase.
-      const retrySafeMissingSession = processStopped && !proc.timedOut && !proc.signal && !proc.errorCode
-        && primaryOutputComplete && !primary.executionStarted && !consumeAccounting("").usageReported
-        && isOpenCodePreDispatchSessionRejection(proc.stdout);
+      const stoppedBeforeExecution = processStopped && !proc.timedOut && !proc.signal && !proc.errorCode
+        && primaryOutputComplete && !primary.executionStarted && !consumeAccounting("").usageReported;
+      const retrySafeMissingSession = stoppedBeforeExecution && isOpenCodePreDispatchSessionRejection(proc.stdout);
+      const streamedStderrDigest = stderrDigest.digest("hex");
+      const stderrComplete = stderrBytes === 0 || (stderrBytes === Buffer.byteLength(proc.stderr)
+        && streamedStderrDigest === createHash("sha256").update(proc.stderr).digest("hex"));
+      const clearLegacyMissingSession = Boolean(resumeSessionId && stoppedBeforeExecution
+        && typeof proc.exitCode === "number" && proc.exitCode > 0 && Number.isSafeInteger(proc.exitCode)
+        && !proc.stdout.trim() && stderrComplete
+        && isOpenCodeLegacySessionRejection(proc.stderr, resumeSessionId));
       let captureIncomplete = false;
       if (captureEnabled) {
         if (!hasAccounting && proc.stdout) {
@@ -781,7 +791,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // adapter-owned capture result may supply this fixed diagnostic code.
       if (captureIncomplete) parsed.errorMessage = [parsed.errorMessage,
         "opencode_compaction_accounting_incomplete"].filter(Boolean).join("\n");
-      return { proc, rawStderr: proc.stderr, parsed, assignmentReceipt, resumeSessionId, retrySafeMissingSession };
+      return { proc, rawStderr: proc.stderr, parsed, assignmentReceipt, resumeSessionId, retrySafeMissingSession, clearLegacyMissingSession };
     };
 
     const toResult = (
@@ -899,6 +909,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         return toResult(retry, true);
       }
 
+      if (initial.clearLegacyMissingSession) {
+        await onLog("stdout", "[paperclip] OpenCode rejected the saved session file; clearing its reference for a later run. This turn was not resent.\n");
+        return toResult(initial, true);
+      }
       return toResult(initial);
     };
 
