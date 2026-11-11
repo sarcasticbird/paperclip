@@ -53,6 +53,7 @@ import {
 import { createSandboxRunLogTailFactory, type SandboxRunLogTailFactory } from "./sandbox-run-log-stream.js";
 import { runChildProcess, type RunProcessResult } from "./server-utils.js";
 import { shellQuote } from "./ssh.js";
+import { githubBrokerEnvironment, githubLauncherSource } from "./github-launcher.js";
 import type { CommandManagedDuplexChannel } from "./command-managed-runtime.js";
 import {
   DEFAULT_MAX_DUPLEX_FRAME_BYTES,
@@ -2400,6 +2401,10 @@ describe("sandbox adapter execution targets", () => {
       expect(bridge?.env.PAPERCLIP_API_KEY).not.toBe("real-run-jwt");
       expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
 
+      expect(bridge?.env.PAPERCLIP_GITHUB_BROKER_URL).toBe(bridge?.env.PAPERCLIP_API_URL);
+      expect(bridge?.env.PAPERCLIP_GITHUB_BRIDGE_TOKEN).toBe(bridge?.env.PAPERCLIP_API_KEY);
+      expect(bridge?.env).not.toHaveProperty("PAPERCLIP_GITHUB_BROKER_TOKEN");
+
       const response = await fetch(`${bridge!.env.PAPERCLIP_API_URL}/api/agents/me`, {
         headers: {
           authorization: `Bearer ${bridge!.env.PAPERCLIP_API_KEY}`,
@@ -2420,6 +2425,59 @@ describe("sandbox adapter execution targets", () => {
       await new Promise<void>((resolve) => apiServer.close(() => resolve()));
     }
   });
+
+  it("routes managed GitHub launchers through the callback bridge without adapter-specific projection", async () => {
+    const { rootDir, remoteCwd } = await createSandboxWorkspace("paperclip-github-callback-");
+    const managed = path.join(rootDir, "managed"), real = path.join(rootDir, "real");
+    await mkdir(managed); await mkdir(real);
+    await writeFile(path.join(managed, "package.json"), '{"type":"commonjs"}\n');
+    await writeFile(path.join(managed, "gh"), githubLauncherSource({ interpreterPath: process.execPath }), { mode: 0o700 });
+    await writeFile(path.join(real, "gh"), `#!${process.execPath}\nconsole.log(JSON.stringify({ managed: process.env.GH_TOKEN === "operation-fixture" }));\n`, { mode: 0o700 });
+    const requests: Array<{ auth?: string; capability?: string; runId?: string }> = [];
+    const api = createServer((req, res) => {
+      const auth = req.headers.authorization;
+      const capability = req.headers["x-paperclip-github-capability"] as string | undefined;
+      requests.push({ auth, capability, runId: req.headers["x-paperclip-run-id"] as string | undefined });
+      const allowed = req.url === "/runtime-tools/github/credentials" && auth === "Bearer host-run-fixture" && capability === "run-capability-fixture";
+      res.writeHead(allowed ? 200 : 403, { "content-type": "application/json" });
+      res.end(JSON.stringify(allowed ? { status: "available", env: { GH_TOKEN: "operation-fixture" } } : {}));
+    });
+    await new Promise<void>(resolve => api.listen(0, "127.0.0.1", resolve));
+    const origin = `http://127.0.0.1:${(api.address() as net.AddressInfo).port}`;
+    let bridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
+    try {
+      bridge = await startAdapterExecutionTargetPaperclipBridge({ runId: "github-bridge-run",
+        target: queueSandboxTarget(remoteCwd), runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "opencode"),
+        adapterKey: "opencode", hostApiToken: "host-run-fixture", hostApiUrl: origin });
+      expect(bridge).not.toBeNull();
+      // Heartbeat supplies the host broker first; the adapter later merges the
+      // bridge env. Exercise that ordering with no Wrap or launcher-side repair.
+      const inherited = githubBrokerEnvironment({ HOME: rootDir, GH_CONFIG_DIR: rootDir,
+        PATH: `${managed}:${real}:${path.dirname(process.execPath)}:/usr/bin:/bin` },
+      { url: origin, token: "run-capability-fixture" });
+      const env = { ...inherited, ...bridge!.env };
+      expect(env.PAPERCLIP_GITHUB_BROKER_URL).toBe(bridge!.env.PAPERCLIP_API_URL);
+      expect(env.PAPERCLIP_GITHUB_BROKER_TOKEN).toBe("run-capability-fixture");
+      const invoke = async (overrides: Record<string, string> = {}) => {
+        const result = await execFileAsync(path.join(managed, "gh"), ["api", "user"], {
+          cwd: rootDir, env: { ...env, ...overrides }, timeout: 10000,
+        });
+        return JSON.parse(result.stdout) as { managed: boolean };
+      };
+      expect(await invoke()).toEqual({ managed: true });
+      expect(requests).toEqual([{ auth: "Bearer host-run-fixture", capability: "run-capability-fixture", runId: "github-bridge-run" }]);
+      expect(await invoke({ PAPERCLIP_GITHUB_BROKER_TOKEN: "wrong-capability" })).toEqual({ managed: false });
+      expect(requests.at(-1)?.capability).toBe("wrong-capability");
+      const before = requests.length;
+      expect(await invoke({ PAPERCLIP_GITHUB_BRIDGE_TOKEN: "stale-bridge-token" })).toEqual({ managed: false });
+      expect(requests).toHaveLength(before); // rejected by the real guest bridge
+      expect(await invoke({ PAPERCLIP_GITHUB_BROKER_TOKEN: "" })).toEqual({ managed: false });
+      expect(requests).toHaveLength(before); // routing grants no new capability
+    } finally {
+      await bridge?.stop();
+      await new Promise<void>(resolve => api.close(() => resolve()));
+    }
+  }, 20000);
 
   it("creates a sandbox run log tail factory when bridge streaming is enabled", async () => {
     const rootDir = await createSandboxRoot("paperclip-execution-target-bridge-stream-");
@@ -3576,6 +3634,9 @@ describe("sandbox adapter execution targets", () => {
       expect(bridge).not.toBeNull();
       expect(control.openCount).toBe(1);
       expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("http2_v1");
+      expect(bridge?.env.PAPERCLIP_GITHUB_BROKER_URL).toBe(bridge?.env.PAPERCLIP_API_URL);
+      expect(bridge?.env.PAPERCLIP_GITHUB_BRIDGE_TOKEN).toBe(bridge?.env.PAPERCLIP_API_KEY);
+      expect(bridge?.env).not.toHaveProperty("PAPERCLIP_GITHUB_BROKER_TOKEN");
       // The host builds the origin from the port it assigned, never from a frame.
       expect(bridge?.env.PAPERCLIP_API_URL).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
       expect(bridge?.env.PAPERCLIP_API_KEY).not.toBe("real-run-jwt");

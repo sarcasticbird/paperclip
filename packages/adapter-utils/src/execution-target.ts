@@ -4939,6 +4939,10 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
               PAPERCLIP_API_URL: sandboxOrigin,
               PAPERCLIP_API_KEY: bridgeToken,
               PAPERCLIP_API_BRIDGE_MODE: SANDBOX_CALLBACK_BRIDGE_HTTP2_MODE,
+              // Route managed GitHub operations through this same transport.
+              // The heartbeat-owned per-run broker capability stays unchanged.
+              PAPERCLIP_GITHUB_BROKER_URL: sandboxOrigin,
+              PAPERCLIP_GITHUB_BRIDGE_TOKEN: bridgeToken,
             },
             runLogTail: duplexRunLogTail,
             readRunDisposition: (): DuplexBrokerRunDisposition => dispositionLatch.disposition,
@@ -5025,6 +5029,10 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       PAPERCLIP_API_KEY: bridgeToken,
       PAPERCLIP_API_BRIDGE_MODE: "queue_v1",
       PAPERCLIP_BRIDGE_QUEUE_DIR: queueDir,
+      // Override the host broker URL when adapters merge this guest bridge env.
+      // Transport authentication is distinct from the existing run capability.
+      PAPERCLIP_GITHUB_BROKER_URL: server.baseUrl,
+      PAPERCLIP_GITHUB_BRIDGE_TOKEN: bridgeToken,
     },
     runLogTail,
     stop: async () => {

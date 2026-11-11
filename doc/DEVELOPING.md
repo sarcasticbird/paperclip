@@ -3568,6 +3568,19 @@ The batch permits at most 16 files and 1 MiB of shell input. Launcher staging
 keeps its 15-second deadline. Run `packages/adapter-utils/src/github-launcher-environment.test.ts`
 and `packages/adapter-utils/src/sandbox-callback-bridge.test.ts` for these contracts.
 
+The sandbox callback bridge supplies GitHub broker routing in its returned
+environment for both queue and HTTP/2 transports. Adapters merge this environment
+after heartbeat preparation: `PAPERCLIP_GITHUB_BROKER_URL` replaces the controller
+URL with the guest bridge origin, and `PAPERCLIP_GITHUB_BRIDGE_TOKEN` carries the
+bridge transport token. The existing heartbeat-owned
+`PAPERCLIP_GITHUB_BROKER_TOKEN` remains the separate per-run capability; creating
+a callback bridge does not grant managed GitHub access. No bridge means no routing
+override. Do not repair this by copying controller credentials into the guest or
+by selecting a different GitHub identity. Regression coverage lives in
+`execution-target-sandbox.test.ts` and OpenCode's
+`execute-sandbox-session.test.ts`; local bridge tests are not exact-guest release
+qualification.
+
 ### Native runner restart recovery
 
 An explicit Retry can continue a recovered setup failure that began as a
