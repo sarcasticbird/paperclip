@@ -1,4 +1,5 @@
 import type { WorkspaceCheckpointMetrics } from "./workspace-checkpoint.js";
+import { extractSandboxSnapshotArchive } from "./sandbox-snapshot-archive.js";
 import { workspaceSeedGeneration, workspaceSeedCloneSnapshot, readWorkspaceSeedGeneration, publishWorkspaceSeedGeneration } from "./workspace-seed-cache.js";
 import { writeCheckpointBaseline, workspaceCheckpointScript, readCheckpointSnapshot, validateCheckpointPayload } from "./workspace-checkpoint.js";
 import { execFile as execFileCallback } from "node:child_process";
@@ -1003,14 +1004,12 @@ async function confineFullWorkspaceExport(root: string, rejectExternalSymlinks =
   await walk(canonicalRoot);
 }
 
-/** Export into a caller-owned empty staging directory, without a merge baseline
- * or any writes to the original host workspace. The normal transfer client owns
- * archive validation; snapshots additionally reject links that cannot be kept. */
 export async function exportSandboxWorkspaceSnapshot(input: {
   client: SandboxManagedRuntimeClient;
   remoteDir: string;
   stagingDir: string;
   operationId: string;
+  timeoutMs?: number;
 }): Promise<void> {
   await fs.mkdir(input.stagingDir, { recursive: true });
   if ((await fs.readdir(input.stagingDir)).length) throw new Error("Workspace snapshot destination is not empty");
@@ -1019,9 +1018,26 @@ export async function exportSandboxWorkspaceSnapshot(input: {
     files: [{ sourcePath: input.remoteDir, targetPath: input.stagingDir, kind: "directory", exclude: [".paperclip-runtime"] }],
   }];
   assertSyncOperationsConfined(operations, { sourceRoots: [input.remoteDir], targetRoots: [input.stagingDir] });
-  if (!input.client.syncOut) throw Object.assign(new Error("Validated workspace export is unavailable for this provider"),
-    { code: "WORKSPACE_SNAPSHOT_EXPORT_UNSUPPORTED" });
-  await input.client.syncOut(operations);
+  if (input.client.syncOut) await input.client.syncOut(operations);
+  else {
+    const limit = 64 * 1024 * 1024;
+    const tooLarge = () => Object.assign(new Error("Command-only workspace snapshot exceeds 64 MiB; source retained"),
+      { code: "WORKSPACE_SNAPSHOT_EXPORT_UNSUPPORTED" });
+    const options = { timeoutMs: input.timeoutMs ?? 120_000 };
+    const remoteRoot = `/tmp/paperclip-recovery-${randomUUID()}`;
+    const remoteArchive = path.posix.join(remoteRoot, "workspace.tar");
+    await input.client.run(`umask 077; mkdir -m 700 -- ${shellQuote(remoteRoot)}`, options);
+    try {
+      await input.client.run(`sh -c ${shellQuote("ulimit -f 65536 && " + createRemoteTarballFromDirectoryCommand({
+        remoteDir: input.remoteDir, archivePath: remoteArchive, exclude: [".paperclip-runtime"], format: "ustar",
+      }))}`, options);
+      const bytes = toBuffer(await input.client.readFile(remoteArchive, { onProgress: (transferred, total) => {
+        if (transferred > limit || (total !== null && total > limit)) throw tooLarge();
+      } }));
+      if (bytes.byteLength > limit) throw tooLarge();
+      await extractSandboxSnapshotArchive({ bytes, localDir: input.stagingDir, timeoutMs: options.timeoutMs });
+    } finally { await input.client.remove(remoteRoot).catch(() => undefined); }
+  }
   await confineFullWorkspaceExport(input.stagingDir, true);
 }
 
@@ -1193,13 +1209,14 @@ function createRemoteTarballFromDirectoryCommand(input: {
   remoteDir: string;
   archivePath: string;
   exclude?: string[];
+  format?: "ustar";
 }): string {
   const list = `${input.archivePath}.entries`;
   return [
     `mkdir -p ${shellQuote(path.posix.dirname(input.archivePath))}`,
     `cd ${shellQuote(input.remoteDir)}`,
     `find . -mindepth 1 -maxdepth 1 -print0 > ${shellQuote(list)}`,
-    `tar -cf ${shellQuote(input.archivePath)} ${tarExcludeFlags(input.exclude)} --null -T ${shellQuote(list)}`,
+    `tar ${input.format ? "--format=ustar --no-xattrs " : ""}-cf ${shellQuote(input.archivePath)} ${tarExcludeFlags(input.exclude)} --null -T ${shellQuote(list)}`,
     `rm -f -- ${shellQuote(list)}`,
   ].join(" && ");
 }

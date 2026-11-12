@@ -1,4 +1,6 @@
 import { inspectWorkspaceSource } from "./workspace-source-inspection.js";
+import { buildWorkspaceRealizationRecord } from "./workspace-realization.js";
+import { remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { adapterExecutionControls, createAdapterExecutionControl } from "./adapter-execution-control.js";
 import { resolveExternalTestDatabaseUrl } from "../__tests__/helpers/external-test-database.js";
 import { environmentService } from "./environments.js";
@@ -7,7 +9,7 @@ import * as nativeWorkspaceSync from "./native-runtime/native-workspace-sync.js"
 import { nativeWorkspaceSyncStateRoot, prepareNativeWorkspaceSync, resumeNativeWorkspaceSync } from "./native-runtime/native-workspace-sync.js";
 import { readSystemRecovery, createSystemRecovery, failSystemRecovery, reserveSystemRecoveryAttempt, SystemRecoveryFailure } from "./system-recovery-state.js";
 import { adoptSystemRecovery } from "./system-recovery.js";
-import { verifiedWorkspaceSnapshotReceipt } from "./workspace-recovery-snapshot.js";
+import { attachPreservedWorkspaceSnapshots, verifiedWorkspaceSnapshotReceipt } from "./workspace-recovery-snapshot.js";
 import { requestTaskRetry } from "./task-retry.js";
 import { readFreshWorkspaceReadiness } from "./fresh-workspace-continuation.js";
 import { randomUUID } from "node:crypto";
@@ -142,6 +144,105 @@ describe("automatic retained workspace recovery", () => {
     expect(await inspectWorkspaceSource(db, { companyId: f.companyId, issueId: f.issueId, runId: f.runId, actionId: f.actionId }))
       .toMatchObject({ status: "verified" });
   }, 30_000);
+
+  async function legacyWarmSource(hops = 1) {
+    const f = await warmHandoffSource(hops);
+    const leases = await db.select().from(environmentLeases).where(eq(environmentLeases.companyId, f.companyId));
+    for (const lease of leases) {
+      const realization = buildWorkspaceRealizationRecord({
+        environment: { id: lease.environmentId!, driver: "sandbox" } as Parameters<typeof buildWorkspaceRealizationRecord>[0]["environment"],
+        lease: lease as unknown as Parameters<typeof buildWorkspaceRealizationRecord>[0]["lease"],
+        request: { version: 1, adapterType: "opencode_local", companyId: f.companyId, environmentId: lease.environmentId!,
+          executionWorkspaceId: lease.executionWorkspaceId, issueId: f.issueId, heartbeatRunId: lease.heartbeatRunId!, requestedMode: null,
+          source: { kind: "task_session", localPath: f.host, projectId: null, projectWorkspaceId: null, repoUrl: null,
+            repoRef: null, strategy: "project_primary", branchName: null, worktreePath: null },
+          runtimeOverlay: { provisionCommand: null, runtimeProvisionCommand: null, teardownCommand: null,
+            cleanupCommand: null, workspaceRuntime: null } }, providerMetadata: { remoteCwd: f.remote },
+      });
+      const source = await run(lease.heartbeatRunId!);
+      await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, source.id));
+      await db.update(heartbeatRuns).set({ runtimeMode: "legacy", nativeIssueId: null,
+        runnerProfileJson: { adapterDispatch: { adapterType: "opencode_local" } },
+        contextSnapshot: { issueId: f.issueId, paperclipEnvironment: { workspaceRealization: realization } },
+      }).where(eq(heartbeatRuns.id, source.id));
+      await db.update(environmentLeases).set({ metadata: { ...lease.metadata, workspaceRealization: realization,
+        remoteExecutionTermination: { ...remoteTerminationReceipt(lease, { providerLeaseId: lease.providerLeaseId, state: "stopped" }),
+          confirmedAt: lease.releasedAt!.toISOString() } },
+      }).where(eq(environmentLeases.id, lease.id));
+    }
+    await db.update(issueRecoveryActions).set({ cause: "legacy_execution_requires_reconciliation" })
+      .where(eq(issueRecoveryActions.id, f.actionId));
+    const runner = targets.get(f.lease.id)!.runner!;
+    runner.syncIn = async () => ({ filesTransferred: 0, bytesTransferred: 0, operations: [] });
+    runner.syncOut = async operations => {
+      for (const operation of operations) for (const file of operation.files)
+        await cp(file.sourcePath, file.targetPath, { recursive: true, dereference: false });
+      return { filesTransferred: 2, bytesTransferred: 0, operations: [] };
+    };
+    return f;
+  }
+
+  it.each([{ hops: 1, commandOnly: false }, { hops: 2, commandOnly: false },
+    { hops: 1, commandOnly: true }, { hops: 2, commandOnly: true }])(
+    "preserves legacy OpenCode work after $hops verified handoffs, commandOnly=$commandOnly, without replay or host overlay", async ({ hops, commandOnly }) => {
+    const f = await legacyWarmSource(hops);
+    if (commandOnly) {
+      delete targets.get(f.lease.id)!.runner!.syncIn;
+      delete targets.get(f.lease.id)!.runner!.syncOut;
+    }
+    expect(await inspectWorkspaceSource(db, f)).toMatchObject({ status: "verified" });
+    await recoverRetainedWorkspace(f.input);
+    const state = readSystemRecovery((await action(f.actionId)).evidence)!;
+    expect(state.state).toBe("complete");
+    expect(await verifiedWorkspaceSnapshotReceipt(db, { ...f, operationIds: state.preservationOperationIds })).not.toBeNull();
+    await expect(readFile(path.join(f.host, "after-warm-stop.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await hasVerifiedWorkspaceRepair(db, await run(f.runId))).toBe(false);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(hops + 1);
+    const fresh = await mkdtemp(path.join(root, "recovered-attachment-"));
+    const attachments = await attachPreservedWorkspaceSnapshots({ ...f, sourceRunIds: [f.runId], cwd: fresh });
+    expect(attachments).toHaveLength(1);
+    expect(await readFile(path.join(attachments[0].path, "files", "after-warm-stop.txt"), "utf8")).toBe("stopped turn work\n");
+  }, 30_000);
+
+  it.each(["active", "control", "controller", "pid", "missing_stop", "wrong_stop", "destroyed", "late_stop", "restore_failed",
+    "run_binding", "lease_binding", "adapter", "native_owner", "missing_proof", "extra_history", "writer"])(
+    "keeps unsafe legacy handoff history fenced: %s", async fault => {
+      const f = await legacyWarmSource();
+      const [previous] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.priorLeaseId));
+      const prior = await run(f.priorRunId);
+      if (fault === "active") await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, prior.id));
+      if (fault === "control") adapterExecutionControls.set(prior.id, createAdapterExecutionControl());
+      if (fault === "controller") await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(heartbeatRuns.id, prior.id));
+      if (fault === "pid") await db.update(heartbeatRuns).set({ processPid: process.pid }).where(eq(heartbeatRuns.id, prior.id));
+      if (fault === "restore_failed") await db.update(heartbeatRuns).set({ resultJson: { workspaceRestoreFailure: "restore_failed" } }).where(eq(heartbeatRuns.id, prior.id));
+      if (["missing_stop", "wrong_stop", "destroyed", "late_stop", "missing_proof"].includes(fault)) {
+        const metadata = { ...previous.metadata };
+        if (fault === "missing_stop") delete metadata.remoteExecutionTermination;
+        if (fault === "missing_proof") delete metadata.reusableLeaseSuccessor;
+        if (fault === "wrong_stop") metadata.remoteExecutionTermination = { ...(metadata.remoteExecutionTermination as object), runId: f.runId };
+        if (fault === "destroyed") metadata.remoteExecutionTermination = { ...(metadata.remoteExecutionTermination as object), state: "destroyed" };
+        if (fault === "late_stop") metadata.remoteExecutionTermination = { ...(metadata.remoteExecutionTermination as object), confirmedAt: new Date(Date.now() + 60_000).toISOString() };
+        await db.update(environmentLeases).set({ metadata }).where(eq(environmentLeases.id, previous.id));
+      }
+      if (fault === "run_binding") await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId } }).where(eq(heartbeatRuns.id, prior.id));
+      if (fault === "lease_binding") await db.update(environmentLeases).set({ metadata: { ...previous.metadata,
+        workspaceRealization: { ...(previous.metadata!.workspaceRealization as object), providerLeaseId: randomUUID() } } }).where(eq(environmentLeases.id, previous.id));
+      if (fault === "adapter") await db.update(heartbeatRuns).set({ runnerProfileJson: { adapterDispatch: { adapterType: "other" } } }).where(eq(heartbeatRuns.id, prior.id));
+      if (fault === "native_owner") {
+        await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: f.issueId }).where(eq(heartbeatRuns.id, prior.id));
+        await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: prior.id, phase: "committed" });
+      }
+      if (fault === "extra_history") await db.insert(environmentLeases).values({ companyId: f.companyId, environmentId: previous.environmentId,
+        heartbeatRunId: prior.id, issueId: f.issueId, provider: previous.provider, providerLeaseId: previous.providerLeaseId,
+        status: "expired", leasePolicy: "reuse_by_environment", cleanupStatus: "success", metadata: previous.metadata });
+      if (fault === "writer") await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: prior.agentId,
+        issueId: f.issueId, runtimeMode: "legacy", status: "running", contextSnapshot: { issueId: f.issueId } });
+      try {
+        expect(await inspectWorkspaceSource(db, f)).toMatchObject({ status: "blocked",
+          failureCode: fault === "writer" ? "workspace_writer_active" : "allocation_ownership_ambiguous" });
+        expect(f.runtime.resumeRunLease).not.toHaveBeenCalled();
+      } finally { adapterExecutionControls.get(prior.id)?.finish(); adapterExecutionControls.delete(prior.id); }
+    }, 30_000);
 
   // Regression: a native run resumed a warm sandbox and was interrupted before
   // provider work. The restore hold stopped that sandbox and changed its lease

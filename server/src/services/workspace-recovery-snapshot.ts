@@ -110,7 +110,8 @@ export async function preserveWorkspaceSnapshot(input: {
       commandCwd: input.target.remoteCwd, timeoutMs: input.target.timeoutMs ?? 120_000 });
     const directory = path.join(root, "files");
     await exportSandboxWorkspaceSnapshot({ client, remoteDir: input.target.remoteCwd,
-      stagingDir: directory, operationId: `preserve:${input.actionId}:${input.leaseId}` }).catch(error => {
+      stagingDir: directory, operationId: `preserve:${input.actionId}:${input.leaseId}`,
+      timeoutMs: input.target.timeoutMs ?? 120_000 }).catch(error => {
         if (error?.code === "WORKSPACE_SNAPSHOT_EXPORT_UNSUPPORTED")
           throw new SystemRecoveryFailure("source_unavailable", "use_alternative_strategy");
         throw error;

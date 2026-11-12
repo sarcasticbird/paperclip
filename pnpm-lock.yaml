@@ -174,10 +174,16 @@ importers:
       smol-toml:
         specifier: ^1.9.1
         version: 1.9.1
+      tar-stream:
+        specifier: 3.2.0
+        version: 3.2.0
     devDependencies:
       '@types/node':
         specifier: ^24.0.0
         version: 24.13.3
+      '@types/tar-stream':
+        specifier: 3.1.5
+        version: 3.1.5
       tsx:
         specifier: ^4.23.15
         version: 4.23.15

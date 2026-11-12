@@ -7,6 +7,7 @@ import { readNativeWorkspaceSyncReference } from "./native-runtime/native-worksp
 import { readSystemRecovery, SystemRecoveryFailure } from "./system-recovery-state.js";
 import type { NativeWorkspaceFinalizationOwnership } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { readStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
+import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isAbandonedPreparedRemoteWorkspace } from "./remote-workspace-abandoned-preparation.js";
 import { LEGACY_WORKSPACE_RECOVERY_SCHEMA, SETTLED_WORKSPACE_RESTORE_HOLD_KEY } from "./workspace-restore-recovery-state.js";
 import { ENVIRONMENT_LEASE_POLICIES, EXECUTION_RECONCILIATION_CAUSES, readRemoteWorkspaceAuthority, remoteWorkspaceRunReferenceSchema, type EnvironmentLeasePolicy,
@@ -25,6 +26,36 @@ export function workspaceSourceBindingFailure(reason: WorkspaceSourceVerificatio
 }
 
 export class WorkspaceSourceInspectionLimit extends Error {}
+
+function legacyWorkspaceBinding(run: typeof heartbeatRuns.$inferSelect, lease: typeof environmentLeases.$inferSelect) {
+  const object = (value: unknown): Record<string, unknown> =>
+    value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  if (run.runtimeMode !== "legacy" || run.runnerProfileJson?.nativeWorkspaceSync != null ||
+      run.runnerProfileJson?.remoteWorkspace != null || lease.metadata?.agentId !== run.agentId ||
+      lease.issueId !== (run.issueId ?? run.contextSnapshot?.issueId)) return null;
+  const adapterType = object(run.runnerProfileJson?.adapterDispatch).adapterType;
+  if (typeof adapterType !== "string" || !adapterType) return null;
+  const fromRun = object(object(run.contextSnapshot?.paperclipEnvironment).workspaceRealization);
+  const fromLease = object(lease.metadata?.workspaceRealization);
+  let binding: { workspaceId: string | null; scopeKey: string; localPath: string; remoteCwd: string; adapterType: string } | null = null;
+  for (const realization of [fromRun, fromLease]) {
+    const rebuild = object(realization.rebuild), local = object(realization.local), remote = object(realization.remote);
+    if (realization.version !== 1 || realization.mode !== "copy" || realization.leaseId !== lease.id ||
+        realization.environmentId !== lease.environmentId || realization.provider !== lease.provider ||
+        realization.providerLeaseId !== lease.providerLeaseId || rebuild.providerLeaseId !== lease.providerLeaseId ||
+        rebuild.executionWorkspaceId !== lease.executionWorkspaceId ||
+        typeof local.path !== "string" || !local.path.startsWith("/") || realization.authoritativeRoot !== local.path ||
+        rebuild.localPath !== local.path || remote.path !== lease.metadata?.remoteCwd || rebuild.remotePath !== remote.path ||
+        typeof remote.path !== "string" || !remote.path.startsWith("/")) return null;
+    const observed = { workspaceId: lease.executionWorkspaceId,
+      scopeKey: lease.executionWorkspaceId === null ? `issue:${lease.issueId}` : `workspace:${lease.executionWorkspaceId}`, localPath: local.path,
+      remoteCwd: remote.path, adapterType };
+    if (binding && (observed.scopeKey !== binding.scopeKey || observed.localPath !== binding.localPath ||
+        observed.remoteCwd !== binding.remoteCwd)) return null;
+    binding = observed;
+  }
+  return binding;
+}
 
 // A resolved hold that a sibling's save settled has nothing left to recover,
 // so it is never selected again, even when it names a historical source.
@@ -188,7 +219,9 @@ export async function inspectWorkspaceRecoverySource(db: Db, input: WorkspaceRec
       ne(environmentLeases.id, lease.id), eq(environmentLeases.provider, lease.provider),
       eq(environmentLeases.providerLeaseId, lease.providerLeaseId)));
     const predecessors = retiredReusableLeasePredecessors(lease, history);
-    if (!predecessors || (predecessors.length && ((run.runtimeMode !== "native" && !remoteDescriptor) || !descriptor || lease.metadata?.agentId !== run.agentId)))
+    const legacyBinding = !descriptor ? legacyWorkspaceBinding(run, lease) : null;
+    if (!predecessors || (predecessors.length && !legacyBinding &&
+        ((run.runtimeMode !== "native" && !remoteDescriptor) || !descriptor || lease.metadata?.agentId !== run.agentId)))
       throw new SystemRecoveryFailure("allocation_ownership_ambiguous", "service_required");
     const predecessorRuns = predecessors.map(item => item.heartbeatRunId!);
     const priors = predecessorRuns.length ? await db.select().from(heartbeatRuns).where(and(
@@ -206,6 +239,24 @@ export async function inspectWorkspaceRecoverySource(db: Db, input: WorkspaceRec
         : priorRemote?.state === "saved" && Boolean(priorRemote.snapshotId) && Boolean(remoteDescriptor)
           && priorRemote.epoch < remoteDescriptor!.epoch;
       const priorOwner = priorOwners.find(item => item.runId === predecessor.heartbeatRunId);
+      if (legacyBinding) {
+        const priorBinding = prior && legacyWorkspaceBinding(prior, predecessor);
+        const stop = predecessor.metadata?.remoteExecutionTermination as { state?: unknown; confirmedAt?: unknown } | undefined;
+        const stoppedAt = typeof stop?.confirmedAt === "string" ? Date.parse(stop.confirmedAt) : NaN;
+        if (!prior || !priorBinding || prior.agentId !== run.agentId || predecessor.issueId !== input.issueId ||
+            prior.status !== "succeeded" || prior.processPid !== null || prior.processGroupId !== null ||
+            !prior.finishedAt || !predecessor.releasedAt || prior.finishedAt > predecessor.releasedAt ||
+            adapterExecutionControls.has(prior.id) || priorOwner ||
+            (prior.controllerLeaseExpiresAt && prior.controllerLeaseExpiresAt > new Date()) ||
+            prior.resultJson?.workspaceRestoreFailure || prior.resultJson?.workspaceRestoreRecovery ||
+            !hasRemoteTerminationReceipt(predecessor) ||
+            stop?.state !== "stopped" || !Number.isFinite(stoppedAt) || stoppedAt < predecessor.acquiredAt.getTime() ||
+            stoppedAt > predecessor.releasedAt.getTime() ||
+            legacyBinding.scopeKey !== priorBinding.scopeKey || legacyBinding.localPath !== priorBinding.localPath ||
+            legacyBinding.remoteCwd !== priorBinding.remoteCwd || legacyBinding.adapterType !== priorBinding.adapterType)
+          throw new SystemRecoveryFailure("allocation_ownership_ambiguous", "service_required");
+        continue;
+      }
       if (!prior || prior.runtimeMode !== "native" || prior.agentId !== run.agentId ||
           !predecessor.issueId || prior.nativeIssueId !== predecessor.issueId || priorOwner?.issueId !== predecessor.issueId ||
           !terminalWorkspaceRunStates.includes(prior.status) || adapterExecutionControls.has(prior.id) ||
@@ -217,7 +268,7 @@ export async function inspectWorkspaceRecoverySource(db: Db, input: WorkspaceRec
     }
     // Snapshot export writes only a new staging directory. A native baseline
     // merge additionally needs exclusive ownership of its host destination.
-    if (descriptor) {
+    if (descriptor || legacyBinding) {
       const [writer] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.companyId, input.companyId), inArray(heartbeatRuns.status, ["queued", "running"]),
         sql`not exists (select 1 from ${issueRecoveryActions} a
@@ -233,7 +284,8 @@ export async function inspectWorkspaceRecoverySource(db: Db, input: WorkspaceRec
           and ${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}, false)` : undefined,
         or(eq(heartbeatRuns.nativeIssueId, input.issueId), eq(heartbeatRuns.issueId, input.issueId),
           sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`,
-          sql`${heartbeatRuns.contextSnapshot}->>'executionWorkspaceId' = ${descriptor.workspaceId}`))).limit(1);
+          (descriptor ?? legacyBinding)!.workspaceId !== null ? sql`${heartbeatRuns.contextSnapshot}->>'executionWorkspaceId' = ${(descriptor ?? legacyBinding)!.workspaceId}` : undefined,
+          legacyBinding?.workspaceId ? sql`${heartbeatRuns.contextSnapshot}#>>'{paperclipEnvironment,workspaceRealization,rebuild,executionWorkspaceId}' = ${legacyBinding.workspaceId}` : undefined))).limit(1);
       if (writer) throw new SystemRecoveryFailure("workspace_writer_active", "recheck_evidence");
     }
     const [environment] = await db.select().from(environments).where(eq(environments.id, lease.environmentId));
