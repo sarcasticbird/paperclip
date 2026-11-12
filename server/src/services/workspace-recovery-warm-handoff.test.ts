@@ -184,7 +184,7 @@ describe("automatic retained workspace recovery", () => {
 
   it.each([{ hops: 1, commandOnly: false }, { hops: 2, commandOnly: false },
     { hops: 1, commandOnly: true }, { hops: 2, commandOnly: true }])(
-    "preserves legacy OpenCode work after $hops verified handoffs, commandOnly=$commandOnly, without replay or host overlay", async ({ hops, commandOnly }) => {
+    "preserves legacy OpenCode work after $hops confirmed-stopped same-task handoffs, commandOnly=$commandOnly, without replay or host overlay", async ({ hops, commandOnly }) => {
     const f = await legacyWarmSource(hops);
     if (commandOnly) {
       delete targets.get(f.lease.id)!.runner!.syncIn;

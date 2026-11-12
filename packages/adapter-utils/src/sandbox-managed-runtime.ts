@@ -1028,9 +1028,12 @@ export async function exportSandboxWorkspaceSnapshot(input: {
     const remoteArchive = path.posix.join(remoteRoot, "workspace.tar");
     await input.client.run(`umask 077; mkdir -m 700 -- ${shellQuote(remoteRoot)}`, options);
     try {
-      await input.client.run(`sh -c ${shellQuote("ulimit -f 65536 && " + createRemoteTarballFromDirectoryCommand({
+      await input.client.run(`sh -c ${shellQuote("ulimit -f 131072 && " + createRemoteTarballFromDirectoryCommand({
         remoteDir: input.remoteDir, archivePath: remoteArchive, exclude: [".paperclip-runtime"], format: "ustar",
-      }))}`, options);
+      }))}`, options).catch(error => {
+        if (error?.exitCode === 153 && !error?.timedOut) throw tooLarge();
+        throw error;
+      });
       const bytes = toBuffer(await input.client.readFile(remoteArchive, { onProgress: (transferred, total) => {
         if (transferred > limit || (total !== null && total > limit)) throw tooLarge();
       } }));

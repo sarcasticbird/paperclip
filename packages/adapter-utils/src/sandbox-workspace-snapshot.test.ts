@@ -11,7 +11,7 @@ import { exportSandboxWorkspaceSnapshot } from "./sandbox-managed-runtime.js";
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 
-async function fixture() {
+async function fixture(environment: Record<string, string> = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-snapshot-command-")); roots.push(root);
   const source = path.join(root, "source"), staging = path.join(root, "staging");
   await mkdir(source); await mkdir(path.join(source, ".paperclip-runtime"));
@@ -21,7 +21,7 @@ async function fixture() {
     execute: input => new Promise((resolve, reject) => {
       const startedAt = new Date().toISOString();
       const child = execFile(input.command, input.args ?? [], { cwd: input.cwd,
-        env: { ...process.env, ...input.env }, timeout: input.timeoutMs, maxBuffer: 16 * 1024 * 1024 },
+        env: { ...process.env, ...environment, ...input.env }, timeout: input.timeoutMs, maxBuffer: 16 * 1024 * 1024 },
       (error, stdout, stderr) => resolve({ exitCode: error ? typeof error.code === "number" ? error.code : 1 : 0,
         signal: error?.signal ?? null, timedOut: error?.killed ?? false, stdout, stderr, pid: child.pid ?? null, startedAt }));
       child.stdin?.on("error", reject); child.stdin?.end(input.stdin ?? "");
@@ -31,6 +31,35 @@ async function fixture() {
 }
 
 describe("snapshot preservation over the existing command-only transport", () => {
+  it.each([40, 65, 129])("applies the 64 MiB archive budget in a POSIX shell to a %s MiB file", async mib => {
+    const f = await fixture({ POSIXLY_CORRECT: "1" });
+    const bytes = Buffer.alloc(mib * 1024 * 1024, 97);
+    await writeFile(path.join(f.source, "large.bin"), bytes);
+    const snapshot = exportSandboxWorkspaceSnapshot({ client: f.client, remoteDir: f.source,
+      stagingDir: f.staging, operationId: "posix-size-boundary" });
+    if (mib > 64) {
+      await expect(snapshot).rejects.toMatchObject({ code: "WORKSPACE_SNAPSHOT_EXPORT_UNSUPPORTED" });
+      expect(await readdir(f.staging)).toEqual([]);
+    } else {
+      await snapshot;
+      expect((await readFile(path.join(f.staging, "large.bin"))).equals(bytes)).toBe(true);
+    }
+    expect((await readFile(path.join(f.source, "large.bin"))).equals(bytes)).toBe(true);
+  }, 120_000);
+
+  it.each([{ exitCode: 153, timedOut: false }, { exitCode: 153, timedOut: true }, { exitCode: 2, timedOut: false }])(
+    "classifies producer failure without masking unrelated failures: %j", async failure => {
+      const f = await fixture(), error = Object.assign(new Error("producer failed"), failure);
+      vi.spyOn(f.client, "run").mockResolvedValueOnce(undefined).mockRejectedValueOnce(error);
+      vi.spyOn(f.client, "remove").mockResolvedValue(undefined);
+      const snapshot = exportSandboxWorkspaceSnapshot({ client: f.client, remoteDir: f.source,
+        stagingDir: f.staging, operationId: "producer-failure" });
+      if (failure.exitCode === 153 && !failure.timedOut)
+        await expect(snapshot).rejects.toMatchObject({ code: "WORKSPACE_SNAPSHOT_EXPORT_UNSUPPORTED" });
+      else await expect(snapshot).rejects.toBe(error);
+      expect(await readdir(f.staging)).toEqual([]);
+    });
+
   it("validates the entire untrusted archive before writing any host member", async () => {
     const f = await fixture(), archive = pack(), chunks: Buffer[] = [];
     const collected = (async () => { for await (const chunk of archive) chunks.push(Buffer.from(chunk)); return Buffer.concat(chunks); })();
@@ -117,6 +146,7 @@ describe("snapshot preservation over the existing command-only transport", () =>
         await checked(["exec", id, "node", "-e", `const fs=require('node:fs');fs.mkdirSync('${source}',{recursive:true});
           fs.writeFileSync('${source}/saved.txt','saved work\\n');fs.mkdirSync('${source}/.paperclip-runtime');
           fs.writeFileSync('${source}/.paperclip-runtime/private.txt','excluded');
+          fs.writeFileSync('${source}/large.bin',Buffer.alloc(40*1024*1024,97));
           const fd=fs.openSync('${source}/sparse.bin','wx');fs.writeSync(fd,Buffer.from('A'),0,1,0);
           fs.writeSync(fd,Buffer.from('B'),0,1,1048576);fs.closeSync(fd);`]);
         await checked(["exec", id, "/usr/bin/fallocate", "-l", "16384", `${source}/unwritten.bin`]);
@@ -132,9 +162,15 @@ describe("snapshot preservation over the existing command-only transport", () =>
         await exportSandboxWorkspaceSnapshot({ client, remoteDir: source, stagingDir: path.join(root, "files"), operationId: token });
         expect(await readFile(path.join(root, "files", "saved.txt"), "utf8")).toBe("saved work\n");
         expect(await readFile(path.join(root, "files", "unwritten.bin"))).toEqual(Buffer.alloc(16384));
+        expect((await readFile(path.join(root, "files", "large.bin"))).equals(Buffer.alloc(40 * 1024 * 1024, 97))).toBe(true);
         const sparse = Buffer.alloc(1048577); sparse[0] = 65; sparse[1048576] = 66;
         expect(await readFile(path.join(root, "files", "sparse.bin"))).toEqual(sparse);
         await expect(readFile(path.join(root, "files", ".paperclip-runtime", "private.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+        await checked(["exec", id, "node", "-e", `const fs=require('node:fs');const fd=fs.openSync('${source}/oversize.bin','wx');
+          fs.ftruncateSync(fd,129*1024*1024);fs.closeSync(fd);`]);
+        await expect(exportSandboxWorkspaceSnapshot({ client, remoteDir: source, stagingDir: path.join(root, "oversize"),
+          operationId: `${token}:oversize` })).rejects.toMatchObject({ code: "WORKSPACE_SNAPSHOT_EXPORT_UNSUPPORTED" });
+        expect(await readdir(path.join(root, "oversize"))).toEqual([]);
       } finally {
         const row = (await inventory()).find(row => row.id === id);
         if (row) {
